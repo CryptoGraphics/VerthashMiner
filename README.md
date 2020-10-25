@@ -11,12 +11,15 @@ and [lyclMiner](https://github.com/CryptoGraphics/lyclMiner)
 This open source release was made possible thanks to [Vertcoin project](https://vertcoin.org) and its community.
 
 ## Supported hardware
-- AMD GPU GCN 1.0 or later.
-- NVIDIA GPU SM 3.0 or later.
+- AMD GPU GCN 1.0 or later.  
+- NVIDIA GPU with compute capability 3.0 or later.  
+  (Some compute versions may require different miner builds for the CUDA backend. e.g 8.0 requires CUDA 11.0, which removes support for 3.0.)
+
+Additionally miner requires GPU with 2GB VRAM or higher. (depends on the `WorkSize` parameter).
 
 ## Supported platforms
-- AMD: OpenCL driver from AMD Radeon Software driver on Windows. AMDGPU-Pro and ROCm on Linux.
-- NVIDIA: Both OpenCL and CUDA are supported through the proprietary driver.
+- AMD: OpenCL 1.2+ from AMD Radeon Software driver on Windows. AMDGPU-Pro and ROCm on Linux.
+- NVIDIA: Both OpenCL 1.2+ and CUDA are supported through the proprietary driver.
 
 Mesa Gallium Compute and macOS are not supported.
 
