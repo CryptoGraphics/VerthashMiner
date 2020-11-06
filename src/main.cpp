@@ -765,7 +765,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         char ntimestr[9], noncestr[9], *xnonce2str, *req;
 
         le32enc(&ntime, work->data[17]);
-        le32enc(&nonce, work->data[19]);
+        be32enc(&nonce, work->data[19]); // Verthash
         bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
         bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
         xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
@@ -1252,17 +1252,12 @@ static int verthashOpenCL_thread(void *userdata)
     std::string buildOptions0;
     std::string buildOptions;
     // Local work size may change in future releases
-    if (cldevice.vendor == vh::V_NVIDIA)
+    if (cldevice.vendor == vh::V_AMD)
     {
-        localWorkSize = 64;
-        buildOptions += " -DWORK_SIZE=64 ";
-    }
-    else if (cldevice.vendor == vh::V_AMD)
-    {
-        localWorkSize = 64;
         buildOptions0 += " -DBIT_ALIGN";
-        buildOptions += " -DWORK_SIZE=64 -DBIT_ALIGN ";
+        buildOptions += " -DBIT_ALIGN ";
     }
+    buildOptions += " -DWORK_SIZE=64 ";
     // MDIV
     buildOptions += " -DMDIV=" + std::to_string(verthashInfo.bitmask);
     // result validation
