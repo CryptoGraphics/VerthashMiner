@@ -745,8 +745,11 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
     int i;
     bool rc = false;
 
+    static char* last_job_id = NULL;
+
     /* pass if the previous hash is not the current previous hash */
-    if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32))
+    if ((!submit_old && memcmp(work->data + 1, g_work.data + 1, 32))
+    || last_job_id && strcmp(work->job_id, last_job_id) == 0)
     {
         if (opt_debug)
         {
@@ -782,6 +785,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
             applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
             goto out;
         }
+
+        last_job_id = strdup(work->job_id);
     }
     else if (work->txs)
     {
