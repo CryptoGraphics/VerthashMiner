@@ -1,6 +1,6 @@
 
 /*
- * Copyright 2018-2020 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -11,7 +11,8 @@
 
 #include <cassert>
 #include <iostream>
-#include <cstring> 
+#include <cstring>
+#include "../external/fopen_utf8.h"
 #include "ConfigFile.h"
 
 using namespace vh;
@@ -128,7 +129,7 @@ bool ConfigFile::setSource(const char *file, bool ignorecase)
     // open the file
     if(file != 0)
     {
-        FILE * f = fopen(file, "r");
+        FILE * f = fopen_utf8(file, "r");
         char * buf;
         size_t length;
         if(!f)
@@ -238,6 +239,7 @@ parse:
                     current_block_map[ahash(current_variable)] = current_setting_struct;
 #ifndef NDEBUG
                     printf("Block: '%s', Setting: '%s', Value: '%s'\n", current_block.c_str(), current_variable.c_str(), current_setting_struct.AsString.c_str());
+                    fflush(stdout);
 #endif
                     // no longer doing this setting, or in a quote.
                     current_setting = "";
@@ -290,6 +292,7 @@ parse:
 
 #ifndef NDEBUG
                         printf("Block: '%s', Setting: '%s', Value: '%s'\n", current_block.c_str(), current_variable.c_str(), current_setting_struct.AsString.c_str());
+                        fflush(stdout);
 #endif
                         // no longer doing this setting, or in a quote.
                         current_setting = "";

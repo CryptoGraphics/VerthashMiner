@@ -20,7 +20,7 @@ endif()
 
 #endif()
 
-project(VerthashMiner CXX)
+project(VerthashMiner C CXX)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -107,12 +107,12 @@ find_package(CUDA)
 
 if(CUDA_FOUND)
     option(USE_CUDA "Use CUDA" ON)
-    add_definitions(-DHAVE_CUDA)
 else()
     option(USE_CUDA "Use CUDA" OFF)
 endif()
 
 if(USE_CUDA)
+    add_definitions(-DHAVE_CUDA)
     message("INFO: Using CUDA version ${CUDA_VERSION}")
 else()
     message("INFO: Building without CUDA support")
@@ -242,19 +242,21 @@ endif()
 # -----------------------------------------------------------------------------
 if(CUDA_FOUND AND USE_CUDA)
 CUDA_ADD_EXECUTABLE(VerthashMiner
-    src/external/sha3/sha3.cpp
-    src/external/tinycthread/tinycthread.cpp
+    src/vhCuda/verthash.cu
+    src/external/tiny_sha3/sha3.c
+    src/external/tinycthread/tinycthread.c
     src/vhCore/ConfigFile.cpp
     src/vhCore/Util.cpp
-    src/vhCuda/verthash.cu
+    src/vhCore/Verthash.cpp
     src/main.cpp
 )
 else()
 add_executable(VerthashMiner
-    src/external/sha3/sha3.cpp
-    src/external/tinycthread/tinycthread.cpp
+    src/external/tiny_sha3/sha3.c
+    src/external/tinycthread/tinycthread.c
     src/vhCore/ConfigFile.cpp
     src/vhCore/Util.cpp
+    src/vhCore/Verthash.cpp
     src/main.cpp
 )
 endif()

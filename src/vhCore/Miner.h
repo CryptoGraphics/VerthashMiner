@@ -2,7 +2,7 @@
 #define Miner_INCLUDE_ONCE
 
 /*
- * Copyright 2018-2020 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -14,7 +14,7 @@
 #include <inttypes.h>
 #include <jansson.h>
 #include <curl/curl.h>
-#include <external/tinycthread/tinycthread.h>
+#include "../external/tinycthread/tinycthread.h"
 
 #include <stdlib.h>
 #include <stddef.h>
@@ -22,7 +22,7 @@
 /* Define to the full name of this package. */
 #define PACKAGE_NAME "VerthashMiner"
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "0.6.1"
+#define PACKAGE_VERSION "0.6.2"
 
 // alloca detection
 #if !defined(alloca)
@@ -68,7 +68,8 @@ inline static void sleep_ms(int milliseconds)
 #define strdup(...) _strdup(__VA_ARGS__)
 #define strncasecmp(x,y,z) _strnicmp(x,y,z)
 #define strcasecmp(x,y) _stricmp(x,y)
-typedef int ssize_t;
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
 #endif
 
 

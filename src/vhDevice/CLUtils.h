@@ -1,6 +1,6 @@
 
 /*
- * Copyright 2018-2019 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -18,24 +18,26 @@
 #define CL_TARGET_OPENCL_VERSION 120
 
 #include <CL/opencl.h>
-
-#include <iostream> // cerr
-#include <fstream> // ifstream
-#include <sstream> // ostringstream
+#include <string>
 
 //-----------------------------------------------------------------------------
 // cl_amd_device_attribute_query can be undefined inside standard OpenCL headers
 #ifndef CL_DEVICE_TOPOLOGY_AMD
-
 #define CL_DEVICE_TOPOLOGY_AMD                      0x4037
+#endif
+
+#ifndef CL_DEVICE_BOARD_NAME_AMD
 #define CL_DEVICE_BOARD_NAME_AMD                    0x4038
+#endif
+
 typedef union
 {
     struct { cl_uint type; cl_uint data[5]; } raw;
     struct { cl_uint type; cl_char unused[17]; cl_char bus; cl_char device; cl_char function; } pcie;
-} cl_device_topology_amd;
-#define CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD            1
+} clu_device_topology_amd;
 
+#ifndef CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD
+#define CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD            1
 #endif
 //-----------------------------------------------------------------------------
 
@@ -185,50 +187,9 @@ namespace vh
     }
     //-----------------------------------------------------------------------------
     //! Create an OpenCL program from file.
-    inline cl_program cluCreateProgramFromFile(cl_context context, cl_device_id cldevice, const char* build_options, const char* file_name)
+    inline int readFile(unsigned char **output, size_t *size, const char *file_name, const char* mode)
     {
-        cl_int errNum;
-        cl_program program;
-
-        std::ifstream kernelFile(file_name, std::ios::in);
-        if (!kernelFile.is_open())
-        {
-            std::cerr << "Failed to open file for reading: " << file_name << std::endl;
-            return NULL;
-        }
-
-        std::ostringstream oss;
-        oss << kernelFile.rdbuf();
-
-        std::string srcStdStr = oss.str();
-        const char *srcStr = srcStdStr.c_str();
-        program = clCreateProgramWithSource(context, 1, (const char**)&srcStr, nullptr, nullptr);
-        if (program == nullptr)
-        {
-            std::cerr << "Failed to create CL program from source." << std::endl;
-            return NULL;
-        }
-
-        errNum = clBuildProgram(program, 1, &cldevice, build_options, NULL, NULL);
-        if (errNum != CL_SUCCESS)
-        {
-            // Determine the reason for the error
-            char buildLog[16384];
-            clGetProgramBuildInfo(program, cldevice, CL_PROGRAM_BUILD_LOG,
-            sizeof(buildLog), buildLog, NULL);
-
-            std::cerr << "Error in kernel: " << std::endl;
-            std::cerr << buildLog;
-            clReleaseProgram(program);
-            return NULL;
-        }
-
-        return program;
-    }
-    //-----------------------------------------------------------------------------
-    inline int readFile(unsigned char **output, size_t *size, const char *name)
-    {
-        FILE* fp = fopen(name, "rb");
+        FILE* fp = fopen_utf8(file_name, mode);
         if (!fp)
         {
             return -1;
@@ -238,53 +199,113 @@ namespace vh
         *size = ftell(fp);
         fseek(fp, 0, SEEK_SET);
 
-        *output = (unsigned char*)malloc(*size);
-        if (!(*output))
+        *output = (unsigned char *)malloc(*size);
+        if (!*output)
         {
             fclose(fp);
             return -1;
         }
+        memset(*output, 0, *size);
 
-        size_t readRes = fread(*output, 1, *size, fp);
-        if (readRes != (*size))
-        {
-            free(*output);
-            fclose(fp);
-            return -1;
-        }
-
+        fread(*output, *size, 1, fp);
         fclose(fp);
-
         return 0;
     }
     //-----------------------------------------------------------------------------
-    inline cl_program cluCreateProgramWithBinaryFromFile(cl_context context, cl_device_id cldevice, const char* file_name)
+    //! Reads text file. See "readFile()"
+    inline int readTextFile(unsigned char **output, size_t *size, const char *file_name)
     {
+        return readFile(output, size, file_name, "r");
+    }
+    //-----------------------------------------------------------------------------
+    //! Reads binary file. See "readFile()"
+    inline int readBinaryFile(unsigned char **output, size_t *size, const char *file_name)
+    {
+        return readFile(output, size, file_name, "rb");
+    }
+    //-----------------------------------------------------------------------------
+    //! Creates program from text file(kernel source code).
+    inline cl_program cluCreateProgramFromFile(cl_context context, cl_device_id device_id,
+                                               const char* build_options, const char* file_name)
+    {
+        cl_int errorCode = CL_SUCCESS;
+        cl_program program;
+
+        // open kernel file
         unsigned char* sprogram_file = NULL;
         size_t sprogram_size = 0;
-        if (readFile(&sprogram_file, &sprogram_size, file_name) < 0)
+        if (readTextFile(&sprogram_file, &sprogram_size, file_name) < 0)
         {
             printf("Failed to read file: %s\n", file_name);
             fflush(stdout);
+        }
+
+        // create an OpenCL program
+        program = clCreateProgramWithSource(context, 1, (const char**)&sprogram_file, &sprogram_size, &errorCode);
+        if (errorCode != CL_SUCCESS)
+        {
+            printf("Failed to create an OpenCL program from source.\n");
+            fflush(stdout);
+
+            free(sprogram_file);
+
             return NULL;
+        }
+
+        free(sprogram_file);
+
+        // build
+        errorCode = clBuildProgram(program, 1, &device_id, build_options, NULL, NULL);
+
+        // get build logs if there are any.
+        size_t logSize = 0;
+        errorCode = clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
+
+        // hack for NVIDIA OpenCL runtime: returns empty logs with size 2 with some build_options
+        if (logSize > 2)
+        {
+            char *buildLog = (char*)malloc(logSize);
+            memset(buildLog, '\0', logSize);
+            errorCode = clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, logSize, buildLog, NULL);
+
+            puts(buildLog);
+            fflush(stdout);
+
+            free(buildLog);
+        }
+
+        if (errorCode != CL_SUCCESS)
+        {
+            clReleaseProgram(program);
+            return NULL;
+        }
+
+        return program;
+    }
+
+    //-----------------------------------------------------------------------------
+    inline cl_program cluCreateProgramWithBinaryFromFile(cl_context context, cl_device_id device, const char* file_name)
+    {
+        unsigned char* sprogram_file = NULL;
+        size_t sprogram_size = 0;
+        if (readBinaryFile(&sprogram_file, &sprogram_size, file_name) < 0)
+        {
+            printf("Failed to read file: %s\n", file_name);
+            fflush(stdout);
         }
 
         cl_int errorCode;
         cl_program program;
 
-        program = clCreateProgramWithBinary(context, 1, &cldevice, &sprogram_size, (const unsigned char **)&sprogram_file, NULL, &errorCode);
-        // TODO: add check for createWithBinary
-        errorCode = clBuildProgram(program, 1, &cldevice, NULL, NULL, NULL);
+        program = clCreateProgramWithBinary(context, 1, &device, &sprogram_size, (const unsigned char **)&sprogram_file, NULL, &errorCode);
+        errorCode = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
         free(sprogram_file);
         if (errorCode != CL_SUCCESS)
-        {
             return NULL;
-        }
         else
-        {
             return program;
-        }
-    }
+    } 
+
     //-----------------------------------------------------------------------------
 
 } // end namespace vh

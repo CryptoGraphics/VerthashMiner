@@ -4,7 +4,7 @@
  * Copyright 2012 Luke Dashjr
  * Copyright 2012-2017 pooler
  * Copyright 2017 Pieter Wuille
- * Copyright 2018-2020 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -21,7 +21,6 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <errno.h>
-//#include <unistd.h>
 #include <jansson.h>
 #include <curl/curl.h>
 #include <time.h>
@@ -34,7 +33,7 @@
 #include <netinet/tcp.h>
 #endif
 #include "vhCore/Miner.h"
-#include "vhCore/List.h"
+#include "../external/list.h"
 #include "vhCore/Utils.h"
 #include "vhCore/SHA256.h"
 #include "vhCore/ThreadQueue.h"
@@ -68,10 +67,6 @@ static const char *logPrioNames[] = {
 
 void applog(ELogPriority prio, const char *fmt, ...)
 {
-    va_list ap;
-
-    va_start(ap, fmt);
-
     char *f;
     size_t len;
     time_t now;
@@ -101,23 +96,33 @@ void applog(ELogPriority prio, const char *fmt, ...)
             fmt);
     mtx_lock(&applog_lock);
 
+    va_list ap;
+    va_start(ap, fmt);
+
+    va_list apTemp;
+    va_copy(apTemp, ap);
+
     // log to console
-    vfprintf(stderr, f, ap);    // atomic write to stderr
+    vfprintf(stderr, f, apTemp);    // atomic write to stderr
     fflush(stderr);
+
+    va_end(apTemp);
 
     // log to file(optional)
     if (opt_log_file)
     {
         if (applog_file != NULL)
         {
-            vfprintf(applog_file, f, ap);
+            va_copy(apTemp, ap);
+            vfprintf(applog_file, f, apTemp);
             fflush(applog_file);
+            va_end(apTemp);
         }
     }
 
     mtx_unlock(&applog_lock);
 
-    va_end(ap);
+    va_end(ap);  
 }
 
 /* Modify the representation of integer numbers which would cause an overflow
@@ -1131,9 +1136,8 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
         sctx->url = strdup(url);
     }
     free(sctx->curl_url);
-    // TODO: test, must be sctx->curl_url = (char*)malloc(strlen(url)+1);
-    sctx->curl_url = (char*)malloc(strlen(url));
-    sprintf(sctx->curl_url, "http%s", url + 11);
+	sctx->curl_url = (char*)malloc(strlen(url)+1);
+	sprintf(sctx->curl_url, "http%s", strstr(url, "://"));
 
     if (opt_protocol)
         curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
@@ -1477,8 +1481,7 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
     sctx->next_diff = diff;
     mtx_unlock(&sctx->work_lock);
 
-    if (opt_debug)
-        applog(LOG_DEBUG, "Stratum difficulty set to %g", diff);
+    applog(LOG_INFO, "Stratum difficulty set to %g", diff);
 
     return true;
 }

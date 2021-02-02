@@ -1,6 +1,6 @@
 
 /*
- * Copyright 2018-2020 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -11,7 +11,7 @@
 #ifndef Utils_INCLUDE_ONCE
 #define Utils_INCLUDE_ONCE
 
-#include <sys/stat.h>
+#include "../external/fopen_utf8.h"
 #include <assert.h>
 
 #if ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
@@ -114,8 +114,15 @@ inline uint16_t le16dec(const void * pp)
 //----------------------------------------------------------------------------
 inline bool fileExists(const char* file_name)
 {
-    struct stat buffer;   
-    return (stat (file_name, &buffer) == 0); 
+    FILE* f = fopen_utf8(file_name, "rb");
+    if (f != NULL)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
 //----------------------------------------------------------------------------
 inline uint64_t computeAverage(const uint64_t* samples, size_t max_samples, size_t num_samples)

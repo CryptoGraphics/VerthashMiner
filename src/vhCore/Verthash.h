@@ -1,5 +1,5 @@
 /*
- * Copyright 2018-2020 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -11,6 +11,7 @@
 #define Verthash_INCLUDE_ONCE
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -34,61 +35,14 @@ typedef struct VerthashInfo
 //! 0 - Success(No error).
 //! 1 - File name is invalid.
 //! 2 - Memory allocation error
-int verthash_info_init(verthash_info_t* info, const char* file_name)
-{
-    // init fields to 0
-    info->fileName = NULL;
-    info->data = NULL;
-    info->dataSize = 0;
-    info->bitmask = 0;
+int verthash_info_init(verthash_info_t* info, const char* file_name);
 
-    // get name
-    if (file_name == NULL) { return 1; }
-    size_t fileNameLen = strlen(file_name);
-    if (fileNameLen == 0) { return 1; }
+//! Reset all fields and free allocated data.
+void verthash_info_free(verthash_info_t* info);
 
-    info->fileName = (char*)malloc(fileNameLen+1);
-    memset(info->fileName, 0, fileNameLen+1);
-    memcpy(info->fileName, file_name, fileNameLen);
 
-    // Load data
-    FILE *fileMiningData = fopen(info->fileName, "rb");
-    // Failed to open file for reading
-    if (!fileMiningData) { return 1; }
-
-    // Get file size
-    fseek(fileMiningData, 0, SEEK_END);
-    uint64_t fileSize = (uint64_t)ftell(fileMiningData);
-    fseek(fileMiningData, 0, SEEK_SET);
-
-    // Allocate data
-    info->data = (uint8_t *)malloc(fileSize);
-    if (!info->data)
-    {
-        fclose(fileMiningData);
-        // Memory allocation fatal error.
-        return 2;
-    }
-
-    // Load data
-    fread(info->data, fileSize, 1, fileMiningData);
-    fclose(fileMiningData);
-
-    // Update fields
-    info->bitmask = ((fileSize - VH_HASH_OUT_SIZE)/VH_BYTE_ALIGNMENT) + 1;
-    info->dataSize = fileSize;
-
-    return 0;
-}
-
-//! Reset all fields and free allocated data
-void verthash_info_free(verthash_info_t* info)
-{
-    free(info->fileName);
-    free(info->data);
-    info->dataSize = 0;
-    info->bitmask = 0;
-}
+//! Generate verthash data file and save it to specified location.
+int verthash_generate_data_file(const char* output_file_name);
 
 #endif // !Verthash_INCLUDE_ONCE
 

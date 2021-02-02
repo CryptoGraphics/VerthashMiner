@@ -1,7 +1,7 @@
 /*
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2017 pooler
- * Copyright 2018-2020 CryptoGraphics
+ * Copyright 2018-2021 CryptoGraphics
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -40,6 +40,9 @@
 #endif
 #include <netinet/in.h>
 #endif
+
+#define FOPEN_UTF8_IMPLEMENTATION
+#include "external/fopen_utf8.h"
 
 #include "vhCore/Miner.h"
 #include "vhCore/SHA256.h"
@@ -127,7 +130,8 @@ static unsigned long accepted_count = 0L;
 static unsigned long rejected_count = 0L;
 static double *thr_hashrates;
 
-static char const usage[] = PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics <CrGr@protonmail.com>\n"
+static char const usage[] = "\n"
+PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics <CrGr@protonmail.com>\n"
 "\n"
 "Usage: VerthashMiner [options]\n"
 "\n"
@@ -153,14 +157,14 @@ static char const usage[] = PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics
 "--proxy <[PROTOCOL://]HOST[:PORT]>                 (-x)\n\t"
     "Connect through a proxy.\n"
 "\n"
-"--cl-devices <index:wWorkSize index:wWorkSize...>  (-d)\n\t"
+"--cl-devices <index:wWorkSize,index:wWorkSize...>  (-d)\n\t"
     "Select specific OpenCL devices from the list, obtained by '-l' command.\n"
 "\n"
 "--all-cl-devices\n\t"
     "Use all available OpenCL devices from the list, obtained by '-l' command.\n\t"
     "This options as a priority over per device selection using '--cl-devices'\n"
 "\n"
-"--cu-devices <index:wWorkSize index:wWorkSize...>  (-D)\n\t"
+"--cu-devices <index:wWorkSize,index:wWorkSize...>  (-D)\n\t"
     "Select specific CUDA devices from the list, obtained by '-l' command.\n"
 "\n"
 "--all-cu-devices\n\t"
@@ -217,6 +221,9 @@ static char const usage[] = PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics
 "--gen-conf-raw <File>                  (-G)\n\t"
     "Generate a configuration file with raw device list format and exit.\n"
 "\n"
+"--gen-verthash-data <File>\n\t"
+    "Generate a verthash data file and exit.\n"
+"\n"
 "--verthash-data <File>                 (-f)\n\t"
     "Specify verthash mining data file.\n"
 "\n"
@@ -266,6 +273,7 @@ static struct option const options[] = {
     { "user", 1, NULL, 'u' },
     { "gen-conf", 1, NULL, 'g' },
     { "gen-conf-raw", 1, NULL, 'G' },
+    { "gen-verthash-data", 1, NULL, 1023 },
     { "verthash-data", 1, NULL, 'f' },
     { "no-verthash-data_verification", 0, NULL, 1021 },
     { "log-file", 0, NULL, 1022},
@@ -1482,6 +1490,9 @@ static int verthashOpenCL_thread(void *userdata)
     if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(5) for Verthash kernel.", thr_id); goto out; }
 #endif
 
+    // print work size:
+    applog(LOG_INFO, "cl_device(%d): WorkSize has been set to: %u", thr_id, (uint32_t)workSize);
+
 
     //-------------------------------------
     // compute max runs
@@ -2041,6 +2052,8 @@ static int verthashCuda_thread(void *userdata)
         applog(LOG_ERR, "Verthash data is empty!"); 
     }
 
+    // print work size:
+    applog(LOG_INFO, "cu_device(%d): WorkSize has been set to: %u", cuWorkerIndex, (uint32_t)workSize);
 
     //-------------------------------------
     // reset hash-rate reporting timer
@@ -2653,38 +2666,16 @@ static int stratum_thread(void *userdata)
 
             // Due to session restore feature, first mining.notify message may not request miner to clean previous jobs.
             // Thus 0 block height check is needed here too.
-            if (stratum.job.clean /*|| (verthashInfo.blockHeight == 0)*/)
+            if (stratum.job.clean)
             {
-                //-------------------------------------
-                // Update verthash data if needed
-               /* uint32_t blockHeight = stratum_get_block_height(&stratum);
-                int errorCode = verthash_info_update_data(&verthashInfo, blockHeight);
-                if (errorCode != 0)
+                uint32_t blockHeight = stratum_get_block_height(&stratum);
+                applog(LOG_INFO, "Verthash block: %u", blockHeight);
+
+                if (opt_debug)
                 {
-                    switch (errorCode)
-                    {
-                    case 1:
-                        {
-                            applog(LOG_ERR, "Failed to open verthash data file.");
-                        } break;
-                    case 2:
-                        {
-                            applog(LOG_ERR, "Invalid Verthash data file size. Must be >= lookup area.");
-                        } break;
-                    case 3:
-                        {
-                            applog(LOG_ERR, "Verthash data out of memory error.");
-                        } break;
-                    }
+                    applog(LOG_DEBUG, "Stratum requested work restart");
+                }
 
-                    if (!abort_flag) { abort_flag = true; }
-                    mtx_unlock(&g_work_lock);
-
-                    goto out;
-                }*/
-                //-------------------------------------
-
-                applog(LOG_INFO, "Stratum requested work restart");
                 restart_threads();
             }
 
@@ -2779,6 +2770,7 @@ struct cmd_result_t
 
     // verthash
     char* verthashDataFileName;
+    char* verthashDataFileNameToGenerate;
     bool disableVerthashDataFileVerification;
     
     // overwrite configuration options
@@ -2828,6 +2820,7 @@ inline void cmd_result_init(cmd_result_t* cmdr)
 #endif
 
     cmdr->verthashDataFileName = NULL;
+    cmdr->verthashDataFileNameToGenerate = NULL;
     cmdr->disableVerthashDataFileVerification = false;
 
     cmdr->overwrite_rpcUser = false;
@@ -2861,6 +2854,7 @@ inline void cmd_result_free(cmd_result_t* cmdr)
     free(cmdr->generateConfigFileName);
     free(cmdr->useConfigFileName);
     free(cmdr->verthashDataFileName);
+    free(cmdr->verthashDataFileNameToGenerate);
     cmdr->selectedCLDevices.clear();
     cmdr->selectedCUDevices.clear();
 }
@@ -3133,6 +3127,10 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
         case 1022:          // --log-file
             opt_log_file = true;
             break;
+        case 1023:          // --gen-verthash-data
+            free(cmdr->verthashDataFileNameToGenerate);
+            cmdr->verthashDataFileNameToGenerate = strdup(arg);
+            break;
         case 'v':
             show_version_and_exit();
         case 'h':
@@ -3219,8 +3217,7 @@ BOOL WINAPI on_consoleEvent(DWORD dwType)
 }
 #endif
 
-
-int main(int argc, char *argv[])
+int utf8_main(int argc, char *argv[])
 {
     // Init global lock data
     mtx_init(&applog_lock, mtx_plain);
@@ -3258,18 +3255,36 @@ int main(int argc, char *argv[])
         sTm = gmtime(&now);
 
         strftime(logFileName, sizeof(logFileName), "%Y-%m-%d %H-%M-%S.txt", sTm);
-        applog_file = fopen(logFileName, "w");
-        if (!applog_file)
+        applog_file = fopen_utf8(logFileName, "w");
+        if (applog_file == NULL)
         {
             applog(LOG_WARNING, "Failed to open file for logging(%s).", logFileName);
             applog(LOG_WARNING, "Logging to file is not available.");
         }
     }
 
-    // get raw device list options, which can be modified later depending on supported extensions
-    bool rawDeviceList = cmdr.rawDeviceList;
+    //-------------------------------------
+    // Verthash data file generation (if it was requested)
+    if (cmdr.verthashDataFileNameToGenerate != NULL)
+    {
+        applog(LOG_INFO, "Generating a verthash data file: %s", cmdr.verthashDataFileNameToGenerate);
+        applog(LOG_INFO, "This may take a while...");
+        int res = verthash_generate_data_file(cmdr.verthashDataFileNameToGenerate);
+        if (res != 0)
+        {
+            applog(LOG_ERR, "Failed to generate a verthash data file!");
+        }
+
+        applog(LOG_INFO, "Verthash data file has been generated!", cmdr.verthashDataFileNameToGenerate);
+
+        cmd_result_free(&cmdr);
+        return 0;
+    }
+
     //-------------------------------------
     // OpenCL init
+    // get raw device list options, which can be modified later depending on supported extensions
+    bool rawDeviceList = cmdr.rawDeviceList;
     cl_int errorCode = CL_SUCCESS;
     //-------------------------------------
     // get platform IDs
@@ -3350,7 +3365,7 @@ int main(int argc, char *argv[])
         std::vector<cl_device_id> deviceIds(numDeviceIDs);
         clGetDeviceIDs(clplatformIds[i], CL_DEVICE_TYPE_GPU, numDeviceIDs, deviceIds.data(), nullptr);
 
-        cl_device_topology_amd topology;
+        clu_device_topology_amd topology;
         for (size_t j = 0; j < deviceIds.size(); ++j)
         {
             vh::cldevice_t cldevice;
@@ -3364,7 +3379,7 @@ int main(int argc, char *argv[])
             if (cldevice.vendor == vh::V_AMD)
             {
                 cl_int status = clGetDeviceInfo(deviceIds[j], CL_DEVICE_TOPOLOGY_AMD,
-                                                sizeof(cl_device_topology_amd), &topology, nullptr);
+                                                sizeof(clu_device_topology_amd), &topology, nullptr);
                 if(status == CL_SUCCESS)
                 {
                     if (topology.raw.type == CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD)
@@ -3659,15 +3674,23 @@ int main(int argc, char *argv[])
         vh::generateCUDADeviceConfig(cudeviceListSize, rawDeviceList, configText);
 #endif
         // save a config file.
-        if (fileExists(cmdr.generateConfigFileName))
+        if (fileExists(cmdr.generateConfigFileName) == true)
         {
             applog(LOG_ERR, "Failed to create a configuration file. %s already exists.", cmdr.generateConfigFileName);
             cmd_result_free(&cmdr);
             return 1;
         }
-        std::ofstream cfgOutput(cmdr.generateConfigFileName); 
-        cfgOutput << configText;
-        cfgOutput.close();
+
+        FILE* cfgOutput = fopen_utf8(cmdr.generateConfigFileName, "w");
+        if (cfgOutput == NULL)
+        {
+            applog(LOG_ERR, "Failed to create a configuration file. %s already exists.", cmdr.generateConfigFileName);
+            cmd_result_free(&cmdr);
+            return 1;
+        }
+        fwrite(configText.c_str(), 1, configText.length(), cfgOutput);
+        fclose(cfgOutput);
+
 
         applog(LOG_INFO, "Configuration file: (%s) has been generated.", cmdr.generateConfigFileName);
 
@@ -3802,6 +3825,7 @@ int main(int argc, char *argv[])
             csetting = cf.getSetting("Global", "VerthashDataFile");
             if (csetting)
             {
+                applog(LOG_INFO, "Loading verthash data file...");
                 vhLoadResult = verthash_info_init(&verthashInfo, csetting->AsString.c_str());
             }
             else
@@ -3812,6 +3836,7 @@ int main(int argc, char *argv[])
         }
         else // use data from command line
         {
+            applog(LOG_INFO, "Loading verthash data file...");
             vhLoadResult = verthash_info_init(&verthashInfo, cmdr.verthashDataFileName);
         }
 
@@ -3844,6 +3869,7 @@ int main(int argc, char *argv[])
             // verify data file if enabled
             if (verifyDataFile)
             {
+                applog(LOG_INFO, "Verifying verthash data file...");
                 uint8_t vhDataFileHash[32] = { 0 };
                 sha256s(vhDataFileHash, verthashInfo.data, verthashInfo.dataSize);
                 if (memcmp(vhDataFileHash, verthashDatFileHash_bytes, sizeof(verthashDatFileHash_bytes)) == 0)
@@ -4851,3 +4877,35 @@ int main(int argc, char *argv[])
 
     return 0;
 }
+
+int main(int argc, char * argv[])
+{
+#ifdef _WIN32
+    int win_argc;
+    char ** win_argv;
+
+    wchar_t ** wargv = CommandLineToArgvW(GetCommandLineW(), &win_argc);
+    win_argv         = (char**)malloc((win_argc + 1) * sizeof(char*));
+
+    for(size_t i = 0; i < (size_t)win_argc; i++)
+    {
+        int32_t n   = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        win_argv[i] = (char*)malloc(n);
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, win_argv[i], n, NULL, NULL);
+    }
+    LocalFree(wargv);
+
+    int ret = utf8_main(win_argc, win_argv);
+
+    for(size_t i = 0; i < (size_t)win_argc; i++)
+    {
+        free(win_argv[i]);
+    }
+    free(win_argv);
+
+    return ret;
+#else
+    return utf8_main(argc, argv);
+#endif
+}
+
