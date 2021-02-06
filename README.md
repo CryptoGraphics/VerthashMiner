@@ -59,12 +59,13 @@ All miner settings can also be managed through the configuration file. Similar t
 
    - Alternative (Windows).  
    Create a file `GenerateConfig.bat` in the same folder as `VerthashMiner.exe` with the following content:  
-`./VerthashMiner -g your_config_file.conf`
+`VerthashMiner -g your_config_file.conf`
    - **Additional notes:**
      - Configuration file is generated specifically for your GPU and driver setup.
      - Configuration file must be re-generated every time you add/remove a new Device to/from the PCIe slot.
 	 - If you want to use NVIDIA GPUs with OpenCL backend when CUDA is available, then configuration file must be generated with `--no-restrict-cuda` option.  
-	 	example: `./VerthashMiner -g your_config_file.conf --no-restrict-cuda`
+	 	example(command line): `./VerthashMiner -g your_config_file.conf --no-restrict-cuda`  
+		or bat file: `VerthashMiner -g your_config_file.conf --no-restrict-cuda`
 
 2. **Configuring a miner.**
 Open `your_config_file.conf` using any text editor and edit `"Url"`, `"Username"`, `"Password"` and `"CoinbaseAddress"`(Solo mining only) fields inside a `"Connection"` block.
