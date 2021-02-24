@@ -11,7 +11,7 @@
 #ifndef ConfigGenerator_INCLUDE_ONCE
 #define ConfigGenerator_INCLUDE_ONCE
 
-#include "CLUtils.h"
+#include "DeviceUtils.h"
 #include <vector>
 #include <string>
 
@@ -22,8 +22,12 @@
 
 namespace vh
 {
-    // default work size for all devices
-    static const uint32_t defaultWorkSize = 131072;
+    // default work batch time for all devices
+    static const uint32_t defaultBatchTimeMs = 500; // must be above 0
+    static const int defaultDeviceMonitor = 1; // 1 means enabled
+    static const uint32_t defaultWorkSize = 0; // 0 means automatic
+    static const int defaultGPUTemperatureLimit = 79; // 0 means ignore
+    static const uint32_t defaultOccupancyPct = 100; // 100%
 
 /******************************************************************************
 *  Generates configuration text data for selected OpenCL devices.
@@ -41,7 +45,6 @@ namespace vh
 *******************************************************************************/
 static void generateCLDeviceConfig(const std::vector<cl_platform_id>& clplatformIds,
                                    const std::vector<cldevice_t>& cldevices,
-                                   bool rawDeviceList,
                                    std::string& configText)
 {
     configText += "#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#\n"
@@ -75,131 +78,87 @@ static void generateCLDeviceConfig(const std::vector<cl_platform_id>& clplatform
     }
 
     const std::string defaultWorkSizeString(std::to_string(defaultWorkSize));
+    const std::string defaultBatchTimeMsString(std::to_string(defaultBatchTimeMs));
+    const std::string defaultDeviceMonitorString(std::to_string(defaultDeviceMonitor));
+    const std::string defaultGPUTemperatureLimitString(std::to_string(defaultGPUTemperatureLimit));
+    const std::string defaultOccupancyPctString(std::to_string(defaultOccupancyPct));
     std::string deviceConfText;
     std::string deviceListText;
     std::string deviceName;
     std::string asmProgramName;
-    if(!rawDeviceList)
+
+    for (size_t i = 0; i < cldevices.size(); ++i)
     {
-        int32_t prevPCIeBusId = -1;
-        const std::string availablePlatformIndices("\n#    Available platforms indices: ");
-        std::string pcieBusIdString;
-        std::string platformIndexString;
-        // config texts
-        size_t deviceIndex = 0;
-        for (size_t i = 0; i < cldevices.size(); ++i)
+        const cldevice_t& cldevice = cldevices[i];
+
+        // get device info
+        deviceListText += "\n#\n# DeviceIndex: ";
+        deviceListText += std::to_string(i);
+
+        deviceListText += "\n#    Name: ";
+        // get device name
+        size_t infoSize = 0;
+        deviceName.clear();
+        clGetDeviceInfo(cldevice.clId, CL_DEVICE_NAME, 0, NULL, &infoSize);
+        deviceName.resize(infoSize);
+        clGetDeviceInfo(cldevice.clId, CL_DEVICE_NAME, infoSize, (void *)deviceName.data(), NULL);
+        deviceName.pop_back();
+
+        deviceListText += deviceName;
+
+        deviceListText += "\n#    PCIeId: ";
+
+        if (cldevice.pcieBusId == -1)
         {
-            const cldevice_t& cldevice = cldevices[i];
-
-            if (cldevices[i].pcieBusId != prevPCIeBusId)
-            {
-                prevPCIeBusId = cldevice.pcieBusId;
-
-
-                // info
-                deviceListText += "\n#\n# ";
-                deviceListText += std::to_string(deviceIndex+1);
-                deviceListText +=". ";
-                deviceListText += "Device: ";
-            
-                // get device name
-                size_t infoSize = 0;
-                deviceName.clear();
-                clGetDeviceInfo(cldevice.clId, CL_DEVICE_NAME, 0, NULL, &infoSize);
-                //deviceName.resize(infoSize - 1);
-                deviceName.resize(infoSize);
-                clGetDeviceInfo(cldevice.clId, CL_DEVICE_NAME, infoSize, (void *)deviceName.data(), NULL);
-                deviceName.pop_back();
-
-                deviceListText += deviceName;
-            
-                deviceListText += "\n#    PCIe bus ID: ";
-                pcieBusIdString = std::to_string(prevPCIeBusId);
-                deviceListText += pcieBusIdString;
-                deviceListText += availablePlatformIndices;
-                platformIndexString = std::to_string(cldevice.platformIndex);
-                deviceListText += platformIndexString;
-                // config
-                deviceConfText += "<CL_Device";
-                deviceConfText += std::to_string(deviceIndex);
-                ++deviceIndex;
-
-                deviceConfText += " PCIeBusId = \"";
-                deviceConfText += pcieBusIdString;
-                deviceConfText += "\"";
-
-                deviceConfText += " PlatformIndex = \"";
-                deviceConfText += platformIndexString;
-                deviceConfText += "\"";
-
-                deviceConfText += " BinaryFormat = \"";
-                deviceConfText += "auto";
-                deviceConfText += "\"";
-
-                deviceConfText += " AsmProgram = \"";
-                vh::getAsmProgramNameFromDeviceName(deviceName, asmProgramName);
-                deviceConfText += asmProgramName;
-                deviceConfText += "\"";
-            
-                deviceConfText += " WorkSize = \"";
-                deviceConfText += defaultWorkSizeString;
-                deviceConfText += "\">\n";
-            }
-            else
-            {
-                // if it is the same device, then it means a different platform.
-                deviceListText += ", " + std::to_string(cldevice.platformIndex); 
-            }
+            deviceListText += "not avilable";
         }
-    }
-    else // generate raw device list
-    {
-        for (size_t i = 0; i < cldevices.size(); ++i)
+        else
         {
-            const cldevice_t& cldevice = cldevices[i];
-
-            // get device info
-            deviceListText += "\n#\n# DeviceIndex: ";
-            deviceListText += std::to_string(i);
-
-            deviceListText += "\n#    Name: ";
-            // get device name
-            size_t infoSize = 0;
-            deviceName.clear();
-            clGetDeviceInfo(cldevice.clId, CL_DEVICE_NAME, 0, NULL, &infoSize);
-            deviceName.resize(infoSize);
-            clGetDeviceInfo(cldevice.clId, CL_DEVICE_NAME, infoSize, (void *)deviceName.data(), NULL);
-            deviceName.pop_back();
-
-            deviceListText += deviceName;
-
-            deviceListText += "\n#    PCIeBusId: ";
-            deviceListText += std::to_string(cldevice.pcieBusId);
-
-            deviceListText += "\n#    Platform index: ";
-            deviceListText += std::to_string(cldevice.platformIndex);
-
-            //  get device config
-            deviceConfText += "<CL_Device";
-            deviceConfText += std::to_string(i);
-
-            deviceConfText += " DeviceIndex = \"";
-            deviceConfText += std::to_string(i);
-            deviceConfText += "\"";
-
-            deviceConfText += " BinaryFormat = \"";
-            deviceConfText += "auto";
-            deviceConfText += "\"";
-
-            deviceConfText += " AsmProgram = \"";
-            vh::getAsmProgramNameFromDeviceName(deviceName, asmProgramName);
-            deviceConfText += asmProgramName;
-            deviceConfText += "\"";
-            
-            deviceConfText += " WorkSize = \"";
-            deviceConfText += defaultWorkSizeString;
-            deviceConfText += "\">\n";
+            char pcieStr[9] = { };
+            snprintf (pcieStr, 8, "%02x:%02x:%01x",
+                      cldevice.pcieBusId, cldevice.pcieDeviceId, cldevice.pcieFunctionId);
+            deviceListText += std::string(pcieStr);
         }
+
+        deviceListText += "\n#    Platform index: ";
+        deviceListText += std::to_string(cldevice.platformIndex);
+
+        //  get device config
+        deviceConfText += "<CL_Device";
+        deviceConfText += std::to_string(i);
+
+        deviceConfText += " DeviceIndex = \"";
+        deviceConfText += std::to_string(i);
+        deviceConfText += "\"";
+
+        deviceConfText += " BinaryFormat = \"";
+        deviceConfText += "auto";
+        deviceConfText += "\"";
+
+        deviceConfText += " AsmProgram = \"";
+        vh::getAsmProgramNameFromDeviceName(deviceName, asmProgramName);
+        deviceConfText += asmProgramName;
+        deviceConfText += "\"";
+        
+        deviceConfText += " WorkSize = \"";
+        deviceConfText += defaultWorkSizeString;
+        deviceConfText += "\"";
+
+        deviceConfText += " BatchTimeMs = \"";
+        deviceConfText += defaultBatchTimeMsString;
+        deviceConfText += "\"";
+
+        deviceConfText += " OccupancyPct = \"";
+        deviceConfText += defaultOccupancyPctString;
+        deviceConfText += "\"";
+
+        deviceConfText += " DeviceMonitor = \"";
+        deviceConfText += defaultDeviceMonitorString;
+        deviceConfText += "\"";
+
+        deviceConfText += " GPUTemperatureLimit = \"";
+        deviceConfText += defaultGPUTemperatureLimitString;
+        deviceConfText += "\">\n";
     }
 
     // final composition
@@ -226,11 +185,14 @@ static void generateCLDeviceConfig(const std::vector<cl_platform_id>& clplatform
 *******************************************************************************/
 
 // TODO: PCIeBus id list is not supported
-static void generateCUDADeviceConfig(int num_cudevices,
-                                     bool rawDeviceList,
+static void generateCUDADeviceConfig(const std::vector<cudevice_t>& cudevices,
                                      std::string& configText)
 {
     const std::string defaultWorkSizeString(std::to_string(defaultWorkSize));
+    const std::string defaultBatchTimeMsString(std::to_string(defaultBatchTimeMs));
+    const std::string defaultDeviceMonitorString(std::to_string(defaultDeviceMonitor));
+    const std::string defaultGPUTemperatureLimitString(std::to_string(defaultGPUTemperatureLimit));
+    const std::string defaultOccupancyPctString(std::to_string(defaultOccupancyPct));
     std::string deviceConfText;
     std::string deviceListText;
     std::string deviceName;
@@ -244,10 +206,12 @@ static void generateCUDADeviceConfig(int num_cudevices,
 
     deviceListText.clear();
     deviceConfText.clear();
-    for (int i = 0; i < num_cudevices; ++i)
+    for (size_t i = 0; i < cudevices.size(); ++i)
     {
+        const vh::cudevice_t& cudevice = cudevices[i];
+
         cudaDeviceProp cudeviceProp;
-        cudaGetDeviceProperties(&cudeviceProp, i);
+        cudaGetDeviceProperties(&cudeviceProp, cudevice.cudeviceHandle);
 
         // get device info
         deviceListText += "\n#\n# DeviceIndex: ";
@@ -260,6 +224,20 @@ static void generateCUDADeviceConfig(int num_cudevices,
         deviceName.assign(cudeviceProp.name);
         deviceListText += deviceName;
 
+        deviceListText += "\n#    PCIeId: ";
+
+        if (cudevice.pcieBusId == -1)
+        {
+            deviceListText += "not avilable";
+        }
+        else
+        {
+            char pcieStr[9] = { };
+            snprintf (pcieStr, 8, "%02x:%02x:%01x",
+                      cudevice.pcieBusId, cudevice.pcieDeviceId, cudevice.pcieFunctionId);
+            deviceListText += std::string(pcieStr);
+        }
+
         //  get device config
         deviceConfText += "<CU_Device";
         deviceConfText += std::to_string(i);
@@ -270,6 +248,22 @@ static void generateCUDADeviceConfig(int num_cudevices,
 
         deviceConfText += " WorkSize = \"";
         deviceConfText += defaultWorkSizeString;
+        deviceConfText += "\"";
+
+        deviceConfText += " BatchTimeMs = \"";
+        deviceConfText += defaultBatchTimeMsString;
+        deviceConfText += "\"";
+
+        deviceConfText += " OccupancyPct = \"";
+        deviceConfText += defaultOccupancyPctString;
+        deviceConfText += "\"";
+
+        deviceConfText += " DeviceMonitor = \"";
+        deviceConfText += defaultDeviceMonitorString;
+        deviceConfText += "\"";
+
+        deviceConfText += " GPUTemperatureLimit = \"";
+        deviceConfText += defaultGPUTemperatureLimitString;
         deviceConfText += "\">\n";
     }
 

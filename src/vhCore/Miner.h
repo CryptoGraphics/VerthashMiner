@@ -22,7 +22,7 @@
 /* Define to the full name of this package. */
 #define PACKAGE_NAME "VerthashMiner"
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "0.6.2"
+#define PACKAGE_VERSION "0.7.0"
 
 // alloca detection
 #if !defined(alloca)
@@ -143,6 +143,8 @@ extern struct work_restart *work_restart;
 
 extern volatile bool abort_flag;
 
+extern mtx_t stats_lock;
+
 //-----------------------------------------------------------------------------
 #define JSON_RPC_LONGPOLL	(1 << 0)
 #define JSON_RPC_QUIET_404	(1 << 1)
@@ -195,6 +197,7 @@ struct stratum_ctx
 	mtx_t sock_lock;
     curl_socket_t dummy_socket;
 
+    uint32_t blockHeight;
 	double next_diff;
 
 	char *session_id;

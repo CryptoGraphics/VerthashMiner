@@ -1,4 +1,3 @@
-
 /*
  * Copyright 2018-2021 CryptoGraphics
  *
@@ -17,7 +16,7 @@
 
 #define CL_TARGET_OPENCL_VERSION 120
 
-#include <CL/opencl.h>
+#include "../external/CL/opencl.h"
 #include <string>
 
 //-----------------------------------------------------------------------------
@@ -40,6 +39,18 @@ typedef union
 #define CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD            1
 #endif
 //-----------------------------------------------------------------------------
+// NVIDIA OpenCL stuff
+#ifndef CL_DEVICE_PCI_BUS_ID_NV 
+#define CL_DEVICE_PCI_BUS_ID_NV                     0x4008
+#endif
+
+#ifndef CL_DEVICE_PCI_SLOT_ID_NV
+#define CL_DEVICE_PCI_SLOT_ID_NV                    0x4009
+#endif
+
+#ifndef CL_DEVICE_PCI_DOMAIN_ID_NV
+#define CL_DEVICE_PCI_DOMAIN_ID_NV                  0x400A
+#endif
 
 namespace vh
 {
@@ -71,18 +82,40 @@ namespace vh
     //! OpenCL logical device
     struct cldevice_t
     {
+        // global OCL stuff
         cl_platform_id clPlatformId;
         cl_device_id clId;
-        int32_t pcieBusId;
         int32_t platformIndex;
+
+        // PCIe stuff
+        int32_t pcieBusId;
+        int32_t pcieDeviceId;
+        int32_t pcieFunctionId;
+
+        // ASM program handling
         EAsmProgram asmProgram;
         EBinaryFormat binaryFormat;
+
+        // General
         EVendor vendor;
     };
+#ifdef HAVE_CUDA
+    //-----------------------------------------------------------------------------
+    //! CUDA logical device
+    struct cudevice_t
+    {
+        int cudeviceHandle;
+        // PCIe stuff
+        int32_t pcieBusId;
+        int32_t pcieDeviceId;
+        int32_t pcieFunctionId;
+    };
+#endif
     //-----------------------------------------------------------------------------
     //! Compare cl devices by PCIe Bus Id.
     inline bool compareLogicalDevices(const cldevice_t & d1, const cldevice_t& d2)
     {
+        // TODO: wrong. Must be compared by whole PCIeId, not just bus
         return (d1.pcieBusId < d2.pcieBusId); 
     }
     //-----------------------------------------------------------------------------

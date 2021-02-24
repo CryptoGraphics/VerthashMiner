@@ -13,6 +13,8 @@
 
 #include "../external/fopen_utf8.h"
 #include <assert.h>
+#include <math.h>
+#include <float.h>
 
 #if ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
 #define WANT_BUILTIN_BSWAP
@@ -161,6 +163,12 @@ inline char *strsep(char **str, const char *sep)
     *str = end;
 
 	return s;
+}
+//----------------------------------------------------------------------------
+inline uint64_t align_u64(uint64_t v, uint64_t factor)
+{
+    uint64_t result = v + factor - 1 & ~(factor - 1);
+    return result;
 }
 //----------------------------------------------------------------------------
 

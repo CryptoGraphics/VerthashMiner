@@ -55,7 +55,7 @@ All miner settings can also be managed through the configuration file. Similar t
 
 1. **Generating a configuration file.**
    - Config file can be generated using the following command inside cmd/terminal:  
-`./VerthashMiner --g your_config_file.conf`
+`./VerthashMiner -g your_config_file.conf`
 
    - Alternative (Windows).  
    Create a file `GenerateConfig.bat` in the same folder as `VerthashMiner.exe` with the following content:  
@@ -70,8 +70,7 @@ All miner settings can also be managed through the configuration file. Similar t
 2. **Configuring a miner.**
 Open `your_config_file.conf` using any text editor and edit `"Url"`, `"Username"`, `"Password"` and `"CoinbaseAddress"`(Solo mining only) fields inside a `"Connection"` block.
 Additional notes:  
-   - It is recommended to adjust `WorkSize` parameter for each `Device` to get better performance.
-   - Every single option inside the Configuration file is self documented along with examples.
+   - It is recommended to adjust  `BatchTimeMs` and `OccupancyPct` [parameters](#Static and Adaptive WorkSize configuration) for each `Device` to get better performance or desktop responsiveness.
 
 3. **Use** `VerthashMiner -c your_config_file.conf` **to start mining.**
 	- Alternative (Windows).  
@@ -87,88 +86,91 @@ Command line options have higher priority than the file and it is possible to ov
 `VerthashMiner -c your_config_file.conf -u user -p password`  
 In this case miner will use a configuration file while Username and Password options will be overwritten by command line.
 
-
 ## There is more
 
-### Selecting specific devices
+### Device management
 
+Miner uses 2 backends for device management and mining algorithm implementation.
+- CUDA. Used for NVIDIA devices. All unsupported devices (e.g SM3.0 on CUDA 11 get automatically transfered to the OpenCL backend).
+- OpenCL. Used for AMD, Intel and others. If miner has been compiled with CUDA enabled, then all NVIDIA devices, which are supported by CUDA will be automatically ignored by the OpenCL backend, unless `--no-restrict-cuda` command line parameter is used.
+
+#### Selecting all devices using command line
 CUDA and OpenCL devices are configured separately.
-By default, all devices are being used. However it is possible to select specific ones using a `PCIeBusId` option.
-___
-#### OpenCL device management
-```
-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
-# Device config:
-#
-# Available platforms:
-#
-# 1. Platform name: Advanced Micro Devices, Inc.
-#    Index: 0
-#
-# 2. Platform name: NVIDIA Corporation
-#    Index: 1
-#
-# Available devices:
-#
-# 1. Device: gfx900
-#    PCIe bus ID: 1
-#    Available platforms indices: 0
-#
-# 2. Device: Ellesmere
-#    PCIe bus ID: 3
-#    Available platforms indices: 0
-#
-# 3. Device: Ellesmere
-#    PCIe bus ID: 5
-#    Available platforms indices: 0
-#
-# 4. Device: GeForce RTX 2080 Ti
-#    PCIe bus ID: 7
-#    Available platforms indices: 1
-#
-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+To select all cappable devices use `--all-cl-devices` for OpenCL devices `--all-cu-devices` for CUDA.
 
-<CL_Device0 PCIeBusId = "1" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device1 PCIeBusId = "3" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device2 PCIeBusId = "5" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device3 PCIeBusId = "7" PlatformIndex = "1" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-```
+#### Selecting specific devices using command line
+All devices are selected by indices.
+To print the list of all cappable devices use `--device-list` or `-l` option.
+To select specific device use `--cl-devices` for OpenCL and `--cu-devices` for CUDA.
+For example: `--cl-devices 0,2` will select device0 and device2.
+Additionally, it is possible to set specific paramaters for each device.
+Parameters are specified using prefixes in the following form:
+`device_index:prefixValue:prefixValue, device_index:prefixValue:prefixValue...`
 
-For example: We want to use devices only with `PCIeBusId` 3 and 7.  
-Comment/backup the original list.
-```
-/*
-<CL_Device0 PCIeBusId = "1" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device1 PCIeBusId = "3" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device2 PCIeBusId = "5" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device3 PCIeBusId = "7" PlatformIndex = "1" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-*/
-```
+There 5 prefixes to set 5 different options:
+- `w` set `WorkSize` value. Must be power of 256 or 0(Automatic). Default value is `0`
+- `b` set `BatchTimeMs` value(Automatic work/batch size). Must be above 0. Default value is `500`
+- `o` set `OccupancyPct` value. Must be above 0 and less than or equal 100. Default value is `100`
+- `m` enables or disables device minitoring. 1 enables, 0 disable. Default value is `1`
+- `t` set `GPUTemperatureLimit` value in degrees C. Default value is `79`.
+If parameter is not set manually, then a default value will be used.
+Here are some examples:
+- `--cu-devices 0:w131072,2:w32768` will select CUDA devices 0,2 and set their `WorkSize` values to `131072` and `32768` respectively.
+- `--cu-devices 0:b150:m1:t60,2:w32768` will select CUDA devices 0,2 where device 0 will use an automatic work size with `BatchTimeMs = 150`,
+device monitoring enabled and `GPUTemperatureLimit = 60`.
 
-Copy selected device configurations and rename blocks, so they will start from 0. e.g `<CL_Device0>`, `<CL_Device1>` ...
-```
-<CL_Device0 PCIeBusId = "3" PlatformIndex = "0" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-<CL_Device1 PCIeBusId = "7" PlatformIndex = "1" BinaryFormat = "auto" AsmProgram = "none" WorkSize = "131072">
-```
-___
-#### CUDA device management
-```
-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
-# CUDA Device config:
-#
-# Available devices:
-#
-# DeviceIndex: 0
-#    Name: GeForce RTX 2080 Ti
-#
-# DeviceIndex: 1
-#    Name: GeForce GTX 1080
-#
-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+### Static and Adaptive WorkSize configuration
 
-<CU_Device0 DeviceIndex = "0" WorkSize = "131072">
-<CU_Device1 DeviceIndex = "1" WorkSize = "131072">
-```
+Earlier (pre v0.7.0) VerthashMiner versions have used a hardcoded `WorkSize = 131072`, which was either too low or too high. It was not intuitive to control and caused stability issues.  
+An "Adaptive work size" module has been developed to solve this problem, which allows a new way to configure devices along with new features.
+
+To enable an "Adaptive work size" set `WorkSize = 0`(used by default since v0.7.0), which allows to configure two other options `BatchTimeMs` and `OccupancyPct`.
+VerthashMiner works on job in batches and `WorkSize` parameter allows to specify a batch size(must be a power of 256).
+
+Low values increase CPU and PCIe transfer(GPU to CPU) overhead, which lowers hashrate, but also saves GPU memory, makes other applications and user interface more responsive.
+Higher values on the other hand, are the opposite(too high values may reduce performance too).
+
+But which value is the optimal? It depends on the device capabilities and how long it takes to process a batch(small part of the job).
+We can profile and try to predict a batch time as soon as the miner is the only software running on the GPU.
+
+However things become complicated when we start running other GPU heavy applications e.g games, render/simulate some stuff.
+Batch time may increase by 2x times, 10x times or more, which may trigger `timeout` errors and other issues. Some of them can be mitigated by OS and GPU driver settings.
+
+This is where the `BatchTimeMs` parameter comes in. It allows to specify a "prefered" amount of time(in milliseconds), that the device should spend on processing a single batch.
+VerthashMiner will dynamically select an optimal `WorkSize` for every batch and manage all GPU memory allocations/reallocations.
+
+If there are not enough GPU memory, then the miner will automatically adapt and try to get as closer as possible to the target value.
+Minimal Verthash requirements(2GB memory) still apply here.
+
+Here are some recommendations for `BatchTimeMs` values:
+- For the "performance mode" set value above `100` (e.g in range [100-1000], increase until there is a performance improvement).
+- To make other applications and user interface more responsive: choose values below `100`.
+
+In some cases, low `BatchTimeMs` value will not be enough and desktop can still be quiet unresponsive.(for example when using NVIDIA proprietary driver with X Window system on Linux).  
+Second parameter `OccupancyPct` exists for this reason. It allows to specify a GPU usage in [1%-100%] range.  
+By default Miner is configured to use/occupy 100% of the device resources and will "fight" for them with other GPU applications.  
+Combining `BatchTimeMs` and `OccupancyPct` one can achieve a good balance between performance and GUI responsiveness.
+
+Additional notes:
+- `BatchTimeMs` and `OccupancyPct` parameters work only when "Adaptive batch size" is enabled(`WorkSize = 0`). If `WorkSize` is specified manually, they will be ignored by the miner.
+- Both `BatchTimeMs` and `OccupancyPct` can also be configured using a manual device selection in the command line.(`b` and `o` prefixes)  
+For example: `--cl-devices 0:b50:o75` selects device with index 0, sets `BatchTimeMs` to `50` and `OccupancyPct` to `75%`.
+
+
+### Device monitoring and GPU temperature limit
+
+Since(v0.7.0) Miner allows to monitor device temperature, power usage, fan speed and specify GPU temperature limit to prevent overheat.
+Device monitoring can be enabled with `DeviceMonitor = "1"` and disabled using `DeviceMonitor = "0"`.  
+GPU temperature limit can be set using the `GPUTemperatureLimit` option.  
+For example to set the GPU temperature limit to `79` degrees C use: `GPUTemperatureLimit = "79"`  
+If the limit is reached, the miner will suspend the work of a particular worker and resume after the GPU has cooled down.  
+`GPUTemperatureLimit = "0"` will disable this parameter and leave the GPU temperature limit to the driver.
+
+Additional notes:  
+- Device monitoring features may vary between OS, devices and drivers.
+- `GPUTemperatureLimit` parameter works only when device monitoring is enabled(`DeviceMonitor = "1"`).
+- Both `DeviceMonitor` and `GPUTemperatureLimit` can also be configured using a manual device selection in the command line.(`m` and `t` prefixes)  
+For example: `--cl-devices 0:m1:t79` selects device with index 0, enables device monitoring and sets `GPUTemperatureLimit` to `79` degrees C.
 
 ### Pool connection setup:
 - **Connection password**  
@@ -177,22 +179,6 @@ ___
 ### Comments inside a config file
 
 - Comments can be in C format, e.g. `/* some stuff */`, with a `//` at the start of the line, or in shell format (`#`).
-
-### Raw device list configuration file format:
-This option affects OpenCL device configuration only.  
-There can be a case when all OpenCL devices return the same PCIeBusId and it will be impossible to distinguish between them.  
-If there will be duplicate PCIeBusIds on the same platform, then miner will automatically switch to the `raw device list format`  
-All possible Device/Platform configurations will be listed. A `DeviceIndex` option will used instead of `PCIeBusId` and `PlatformIndex`.  
-If Device has more than one platform available, all duplicates must be handled manually.  
-**Note:** The order in which devices are listed is platform implementation defined. Prefer to use PCIeBusId version whenever possible.
-
-- **DeviceIndex**  
-Specifies a Device/Platform combination from the list.
-
-- **Generating a configuration file with raw device list**  
-`VerthashMiner -G your_config_file.conf`
-
-
 
 ## Building VerthashMiner
 
@@ -248,13 +234,12 @@ To get all physical devices available to the miner use:
 `-l` or `--device-list`  
 To create 2 virtual devices for one physical device, specify the same device twice.  
 `--cl-devices 0:w131072,0:w131072`  
-131072 is a work size(default value). You can try specify your own(e.g 32768, 65536, 262144, 524288 etc) and check performance/power consumption.
+131072 is a work size. You can try specify your own(e.g 32768, 65536, 262144, 524288 etc) and check performance/power consumption.
 
-  2. and 3. Using a Configuration File.  
-OpenCL devices have 2 configuration file formats `PCIeBusID` and `Raw device list`. CUDA devices have only 1(`Raw device list`).  
-Duplicate device configuration block.  
+  2. Using a Configuration File.  
 For example: There will be only 1 `<CL_Device0 ...>` block with 1 physical GPU.
 Duplicate it and rename a new one to `<CL_Device1 ...>`.
 
 * When using 2 or more devices for a single physical GPU, their hash-rate will probably be the same.  
 You can try to specify a different `WorkSize` for each of them and compare multiple `WorkSize` values at the same time. Not sure about accuracy though. It may vary between different GPUs, drivers, OS and other apps running in the background.
+

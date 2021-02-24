@@ -9,11 +9,13 @@
  * any later version.  See COPYING for more details.
  */
 
+#include <stdint.h>
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <inttypes.h>
 #include <time.h>
 #include <assert.h>
 
@@ -50,8 +52,13 @@
 #include "vhCore/ConfigFile.h"
 #include "vhCore/ThreadQueue.h"
 
-#include "vhDevice/CLUtils.h"
+#include "vhDevice/DeviceUtils.h"
 #include "vhDevice/ConfigGenerator.h"
+// Monitoring
+#include "vhDevice/ADLUtils.h"
+#include "vhDevice/NVMLUtils.h"
+#include "vhDevice/SYSFSUtils.h"
+
 #ifdef _WIN32
 #include <external/getopt/getopt.h>
 #else
@@ -120,7 +127,7 @@ mtx_t applog_lock;
 FILE* applog_file = NULL;
 bool opt_log_file = false;
 
-static mtx_t stats_lock;
+mtx_t stats_lock;
 
 
 
@@ -157,14 +164,14 @@ PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics <CrGr@protonmail.com>\n"
 "--proxy <[PROTOCOL://]HOST[:PORT]>                 (-x)\n\t"
     "Connect through a proxy.\n"
 "\n"
-"--cl-devices <index:wWorkSize,index:wWorkSize...>  (-d)\n\t"
+"--cl-devices <index,index,...>  (-d)\n\t"
     "Select specific OpenCL devices from the list, obtained by '-l' command.\n"
 "\n"
 "--all-cl-devices\n\t"
     "Use all available OpenCL devices from the list, obtained by '-l' command.\n\t"
     "This options as a priority over per device selection using '--cl-devices'\n"
 "\n"
-"--cu-devices <index:wWorkSize,index:wWorkSize...>  (-D)\n\t"
+"--cu-devices <index,index,...>  (-D)\n\t"
     "Select specific CUDA devices from the list, obtained by '-l' command.\n"
 "\n"
 "--all-cu-devices\n\t"
@@ -218,9 +225,6 @@ PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics <CrGr@protonmail.com>\n"
 "--gen-conf <File>                      (-g)\n\t"
     "Generate a configuration file with pcie bus IDs(if possible) and exit.\n"
 "\n"
-"--gen-conf-raw <File>                  (-G)\n\t"
-    "Generate a configuration file with raw device list format and exit.\n"
-"\n"
 "--gen-verthash-data <File>\n\t"
     "Generate a verthash data file and exit.\n"
 "\n"
@@ -234,7 +238,7 @@ PACKAGE_NAME " " PACKAGE_VERSION " by CryptoGraphics <CrGr@protonmail.com>\n"
     "Enables logging to file.\n"
 "\n"
 "--device-list                          (-l)\n\t"
-    "Print all available device configurations in raw device list format and exit.\n"
+    "Print all available device configurations and exit.\n"
 "\n"
 "--version                              (-v)\n\t"
     "Display version information and exit.\n"
@@ -272,7 +276,6 @@ static struct option const options[] = {
     { "url", 1, NULL, 'o' },
     { "user", 1, NULL, 'u' },
     { "gen-conf", 1, NULL, 'g' },
-    { "gen-conf-raw", 1, NULL, 'G' },
     { "gen-verthash-data", 1, NULL, 1023 },
     { "verthash-data", 1, NULL, 'f' },
     { "no-verthash-data_verification", 0, NULL, 1021 },
@@ -1174,7 +1177,7 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
     if (opt_debug) {
         char *xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-        applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s ntime=%08x",
+        applog(LOG_DEBUG, "job_id='%s' extranonce2=%s ntime=%08x",
                work->job_id, xnonce2str, swab32(work->data[17]));
         free(xnonce2str);
     }
@@ -1206,17 +1209,25 @@ struct clworker_t
     struct thr_info* threadInfo;
     vh::cldevice_t cldevice;
     size_t workSize;
+    uint32_t batchTimeMs;
+    uint32_t occupancyPct;
+    
+    // monitoring
+    nvmlDevice_t nvmlDevice;
+    int adlAdapterIndex;
+    int gpuTemperatureLimit;
+    int deviceMonitor;
 };
 
 //! sha3/keccak state
 struct kState { uint32_t v[50]; };
-//! uvec8
-struct uvec8 { uint32_t v[8]; };
+//! u32x8
+struct u32x8 { uint32_t v[8]; };
 
 //----------------------------------------------------------------------------
-//! test uvec8 with target
+//! test u32x8 with target
 // TODO: refactor/optimize, remove and use fullTest directly
-inline bool fulltestUvec8(const uvec8& hash, const uint32_t *target)
+inline bool fulltestUvec8(const u32x8& hash, const uint32_t *target)
 {
     bool rc = true;
 
@@ -1241,20 +1252,208 @@ inline bool fulltestUvec8(const uvec8& hash, const uint32_t *target)
 static int verthashOpenCL_thread(void *userdata)
 {
     if (opt_debug)
+    {
         applog(LOG_DEBUG, "Verthash OCL thread started");
+    }
 
+    //-------------------------------------
+    // Get thread data
     clworker_t* clworker = (clworker_t*)userdata;
     vh::cldevice_t& cldevice = clworker->cldevice;
+    struct thr_info *mythr = clworker->threadInfo; 
+    int thr_id = mythr->id;
+    //-------------------------------------
+    // Monitoring data
+    int deviceMonitor = clworker->deviceMonitor;
+    int gpuTemperatureLimit = clworker->gpuTemperatureLimit;
+    bool throttling = false;
+    // stats
+    int temperature = 0;
+    int power = 0;
+    int fanSpeed = 0;
+
+    // NVML
+    nvmlDevice_t nvmlDevice = clworker->nvmlDevice;
+
+#ifdef _WIN32
+    // ADL
+    int adlAdapterIndex = clworker->adlAdapterIndex;
+    int overdriveVersion = 0;
+    ADL_CONTEXT_HANDLE adlContext = NULL;
+
+    if ((clworker->cldevice.vendor == vh::V_AMD) && (deviceMonitor != 0))
+    {
+        int adlRC = ADL2_Main_Control_Create(ADL_Main_Memory_Alloc, 1, &adlContext);
+        if (adlRC == ADL_OK)
+        {
+            // Get overdrive capabilities (supported version etc)
+            int oSupported = 0;
+            int oEnabled = 0;
+            int oVersion = 0;
+            adlRC = ADL2_Overdrive_Caps(adlContext, adlAdapterIndex, &oSupported, &oEnabled, &oVersion);
+            if (adlRC != ADL_OK)
+            {
+                applog(LOG_WARNING, "cl_device(%d):Failed to get ADL Overdrive capabilities!", thr_id);
+            }
+            else
+            {
+                if (oSupported == 0)
+                {
+                    applog(LOG_WARNING, "cl_device(%d):ADL Overdrive is not supported!", thr_id);
+                    adlRC = ADL_ERR;
+                }
+                else if (oEnabled == 0)
+                {
+                    applog(LOG_WARNING, "cl_device(%d):ADL Overdrive is supported, but not enabled!", thr_id);
+                    adlRC = ADL_ERR;
+                }
+                else if ((oVersion < 5) || (oVersion > 8))
+                {
+                    applog(LOG_WARNING, "cl_device(%d):ADL Overdrive(%d) integration is not available!", thr_id, oVersion);
+                    adlRC = ADL_ERR;
+                }
+                else
+                {
+                    // It looks like everything is OK.
+                    overdriveVersion = oVersion;
+                }
+            }
+        }
+        else
+        {
+            applog(LOG_WARNING, "cl_device(%d):Failed to create ADL context.", thr_id);
+        }
+
+        // disable ADL on errors
+        if (adlRC != ADL_OK)
+        {
+            adlAdapterIndex = -1;
+        }
+    }
+
+#elif defined __linux__
+    // SYSFS
+
+    char* sysFsPwm1Path = NULL;
+    char* sysFsPwm1MaxPath = NULL;
+    char* sysFsPower1AveragePath = NULL;
+    char* sysFsTemp1InputPath = NULL;
+
+    // SYSFS monitoring is limited to AMD devices
+    if ((clworker->cldevice.vendor == vh::V_AMD) && (deviceMonitor != 0))
+    {
+        char *sysFsDevicePath = SYSFS_get_syspath_device(cldevice.pcieBusId,
+                                                         cldevice.pcieDeviceId,
+                                                         cldevice.pcieFunctionId);
+        if (sysFsDevicePath != NULL)
+        {
+            char *sysFsHWMONPath = SYSFS_get_syspath_hwmon(sysFsDevicePath);
+            if (sysFsHWMONPath != NULL)
+            {
+                sysFsPwm1Path = SYSFS_get_syspath_pwm1(sysFsHWMONPath);
+                sysFsPwm1MaxPath = SYSFS_get_syspath_pwm1_max(sysFsHWMONPath);
+                sysFsPower1AveragePath = SYSFS_get_syspath_power1_average(sysFsHWMONPath);
+                sysFsTemp1InputPath = SYSFS_get_syspath_temp1_input(sysFsHWMONPath);
+            }
+        }
+        
+        free(sysFsDevicePath);
+    }
+
+#endif // __linux__
+
+
+    // Disable monitoring(and GPU temperature limit) if no backend is available
+    if ((deviceMonitor != 0))
+    {
+#ifdef _WIN32
+        if ((nvmlDevice == NULL) && (adlAdapterIndex == -1))
+        {
+            applog(LOG_WARNING, "cl_device(%d):Monitoring has been disabled. No backends available!", thr_id);
+            deviceMonitor = 0;
+        }
+#elif defined __linux__
+        if ((sysFsPwm1Path == NULL) &&
+            (sysFsPwm1MaxPath == NULL) &&
+            (sysFsPower1AveragePath == NULL) &&
+            (sysFsPower1AveragePath == NULL) &&
+            (nvmlDevice == NULL))
+        {
+            applog(LOG_WARNING, "cl_device(%d):Monitoring has been disabled. No backends available!", thr_id);
+            deviceMonitor = 0;
+        }
+#else
+        //applog(LOG_WARNING, "cl_device(%d):Monitoring has been disabled. No backends available!", thr_id);
+        //deviceMonitor = 0;
+#endif
+    }
+
+    //-------------------------------------
+    // Work related stuff
+    struct work workInfo = {{0}};
+
     //-------------------------------------
     // Init CL data
     cl_int errorCode = CL_SUCCESS;
 
-    // num runs to reach max nonce
-    const uint64_t numNoncesGlobal = 4294967296ULL;
-    uint32_t maxRunsGlobal = (uint32_t)(numNoncesGlobal / (uint32_t)clworker->workSize);
-    size_t workSize = clworker->workSize;
-    const size_t globalWorkSize1x = workSize;
-    const size_t globalWorkSize4x = workSize*4;
+    // adaptive batch size flag
+    const bool adaptiveBatchSize = (clworker->workSize == 0)? true : false;
+
+    // batch size
+    // 4096 is a starting batch size in adaptive mode
+    size_t workSize = (adaptiveBatchSize == true)? 4096 : clworker->workSize;
+
+    // occupancy percent(workSize must be adaptive)
+    uint32_t occupancyPct = (adaptiveBatchSize == true) ? clworker->occupancyPct : 100;
+    // extra check to prevent 0
+    if ((occupancyPct == 0) || (occupancyPct > 100))
+    {
+        occupancyPct = 100;
+    }
+    const uint32_t occupancy = 100 - occupancyPct;
+
+    // these can be changed at runtime if adaptive batch size is enabled
+    size_t globalWorkSize1x = workSize;
+    size_t globalWorkSize4x = workSize*4;
+
+    // Init nonce range 
+    const uint64_t numNoncesGlobal = 4294967296ULL; // global nonce range is [0..4294967295]
+    const uint64_t maxBatches = (numNoncesGlobal / (uint64_t)workSize);
+    uint64_t maxBatchesPerDevice = maxBatches;
+    uint32_t firstNonce = 0;
+    uint64_t maxNonce = numNoncesGlobal; // actually last nonce is maxNonce-1
+    if (have_stratum == false) // GBT
+    {
+        // There is no extranonce2 on GBT. Split a single nonce range between workers.
+        maxBatchesPerDevice = maxBatches / opt_n_threads;
+        // begin nonce range
+        firstNonce = (maxBatchesPerDevice * workSize) * thr_id;
+        // Handle case when the number of workers is not power of 2
+        if (thr_id == (opt_n_threads - 1))
+        {
+            maxBatchesPerDevice += (maxBatches % opt_n_threads);
+        }
+        // end nonce range
+        maxNonce = maxBatchesPerDevice * workSize;
+    }
+
+    //-------------------------------------
+    // Adaptive batch size settings
+    double maxMs = (double)vh::defaultBatchTimeMs; // maxBathTime
+    if(clworker->batchTimeMs != 0)
+    {
+        maxMs = (double)clworker->batchTimeMs;
+    }
+    const uint64_t alignment = 256; // 256 minimum possible value (max local work size in the pipeline)
+    const size_t minBatchSize = alignment;
+    double elapsedTimeMs = maxMs; // batchTimeTimer in milliseconds
+    // Max Work(Batch)Size, that can be used during the adaptive batch size.
+    // It will be lowered automatically, in case of memory allocation errors, but will never go up.
+    size_t maxBatchSize = 134217728;
+    
+    //-------------------------------------
+    // Kernel configurations
+    // local work batch sizes(mostly kernel specific)
     size_t localWorkSize = 64;
     size_t localWorkSize256 = 256;
     std::string buildOptions0;
@@ -1289,24 +1488,10 @@ static int verthashOpenCL_thread(void *userdata)
     std::string fileName_verthash = "kernels/verthash_"+deviceName+".bin";
 #endif
 
-    struct thr_info *mythr = clworker->threadInfo; 
-    int thr_id = mythr->id;
-
-    const uint64_t numNoncesPerDevice = numNoncesGlobal / (uint64_t)opt_n_threads;
-    uint32_t maxRunsPerDevice = (uint32_t)(numNoncesPerDevice / (uint32_t)workSize);
-    // last device
-    if (thr_id == (opt_n_threads-1))
-    {
-        maxRunsPerDevice += (uint32_t)(numNoncesPerDevice % opt_n_threads);
-    }
-    //-------------------------------------
-    struct work workInfo = {{0}};
-    
-    uint32_t numRuns = 0;
 
 #ifdef VERTHASH_FULL_VALIDATION
     // Host side hash storage
-    std::vector<uvec8> verthashIORES;
+    std::vector<u32x8> verthashIORES;
     verthashIORES.resize(workSize);
 #else
     // HTarg result host side storage
@@ -1315,13 +1500,16 @@ static int verthashOpenCL_thread(void *userdata)
 #endif
 
     // init per device profiling data
-    const size_t maxProfSamples = 32;
+    const size_t maxProfSamples = 16;
     size_t numSamples = 0;
     size_t sampleIndex = 0;
     std::vector<uint64_t> profSamples(maxProfSamples, 0);
+    std::vector<uint64_t> batchSamples(maxProfSamples, 0);
+    assert(profSamples.size() == batchSamples.size());
 
     // per hash-rate update timer 
     std::chrono::steady_clock::time_point hrTimerStart;
+    // Hash-rate (console)report interval in seconds
     uint64_t hrTimerIntervalSec = 4; // TODO: make configurable
 
     //-------------------------------------
@@ -1370,7 +1558,7 @@ static int verthashOpenCL_thread(void *userdata)
     if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a SHA3 headers buffer.", thr_id); goto out; }
 
     //! hash results from IO pass
-    clmemResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, workSize * sizeof(uvec8), nullptr, &errorCode);
+    clmemResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, workSize * sizeof(u32x8), nullptr, &errorCode);
     if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an IO results buffer.", thr_id); goto out; }
 
     //! results against hash target.
@@ -1490,21 +1678,21 @@ static int verthashOpenCL_thread(void *userdata)
     if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(5) for Verthash kernel.", thr_id); goto out; }
 #endif
 
-    // print work size:
-    applog(LOG_INFO, "cl_device(%d): WorkSize has been set to: %u", thr_id, (uint32_t)workSize);
+    if (adaptiveBatchSize == false)
+    {
+        // print work size:
+        applog(LOG_INFO, "cl_device(%d): WorkSize has been set to: %u", thr_id, (uint32_t)workSize);
+    }
 
 
     //-------------------------------------
-    // compute max runs
-    // 4294967295 max nonce
-
     // reset the hash-rate reporting timer
     hrTimerStart = std::chrono::steady_clock::now();
 
+    //-------------------------------------
+    // Main worker loop
     while (!abort_flag)
     {
-        uint32_t maxRuns, runs, nonce;
-
         // Stratum
         if (have_stratum)
         {
@@ -1515,14 +1703,7 @@ static int verthashOpenCL_thread(void *userdata)
             }
 
             mtx_lock(&g_work_lock);
-            //if (memcmp(workInfo.data, g_work.data, 76))
-            {
-                stratum_gen_work(&stratum, &g_work);
-            }
-
-            maxRuns = maxRunsGlobal;
-            runs = 0;
-            nonce = 0;
+            stratum_gen_work(&stratum, &g_work);
         }
         else // GBT
         {
@@ -1538,13 +1719,6 @@ static int verthashOpenCL_thread(void *userdata)
             }
 
             g_work_time = time(NULL);
-
-            const uint32_t offsetN = (maxRunsPerDevice * workSize)*thr_id;
-            const uint32_t first_nonce = offsetN + (numRuns * workSize);
-
-            maxRuns = maxRunsPerDevice;
-            runs = 0;
-            nonce = first_nonce;
         }
 
         // create a work copy
@@ -1552,12 +1726,16 @@ static int verthashOpenCL_thread(void *userdata)
         work_copy(&workInfo, &g_work);
         workInfo.data[19] = 0;
 
-        mtx_unlock(&g_work_lock);
         work_restart[thr_id].restart = 0;
+        mtx_unlock(&g_work_lock);
         
+
+        // Actual nonce is 32 bit, but we use 64 bit to prevent possible overflows
+        uint64_t nonce64 = firstNonce;
+
+
         //-------------------------------------
         // Generate midstate
-        // TODO: optimize. Check on every new block
         uint32_t uheader[20] = {0};
         for (size_t i = 0; i < 20; ++i)
         {
@@ -1602,7 +1780,6 @@ static int verthashOpenCL_thread(void *userdata)
 
 
         // Every device works withing its own nonce range.
-        // Not needed for stratum.
         //-------------------------------------
         // Compute hashes
 
@@ -1610,6 +1787,213 @@ static int verthashOpenCL_thread(void *userdata)
         // in case program termination was triggered between work generation and resetting work restart values
         while (!work_restart[thr_id].restart && (!abort_flag))
         {
+            //---------------------------------------------------------------------
+            // Temperature limit
+            // 0 means handled by the device driver. This check is still required in case backend reports wrong temp.
+            if ((gpuTemperatureLimit != 0) && (deviceMonitor != 0))
+            {
+                if (temperature > gpuTemperatureLimit)
+                {
+                    if (throttling == false)
+                    {
+                        throttling = true;
+                        applog(LOG_WARNING, "cl_device(%d): gpu temperature limit has reached %dC(max:%uC), stopping.", thr_id, temperature, gpuTemperatureLimit);
+                    }
+                    // throttling
+                    const int waitTimeMs = 100;
+                    sleep_ms(waitTimeMs);
+
+                    // emit empty sample(
+                    profSamples[sampleIndex] = (uint64_t)waitTimeMs;
+                    batchSamples[sampleIndex] = 0;
+                    sampleIndex = (sampleIndex + 1) & (profSamples.size()-1);
+                    ++numSamples;
+                    if (numSamples > profSamples.size())
+                    {
+                        numSamples = profSamples.size();
+                    }
+
+                    // perform another temperature checks here
+                    if (nvmlDevice != NULL)
+                    {
+                        unsigned int nvmlTemperature = 0;
+                        nvmlReturn_t nvmlRC = nvmlDeviceGetTemperature(nvmlDevice, NVML_TEMPERATURE_GPU, &nvmlTemperature);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            temperature = (int)nvmlTemperature;
+                        }
+                        else
+                        {
+                            applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                            goto out;
+                        }
+                    }
+                    else
+                    {
+#ifdef _WIN32
+                        // ADL
+                        int adlRC = ADL_OK;
+                        if (adlAdapterIndex != -1)
+                        {
+                            adlRC = ALD2_Overdrive_Temperature_Get(adlContext, adlAdapterIndex, overdriveVersion, &temperature);
+                            if (adlRC != ADL_OK)
+                            {
+                                applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                                goto out;
+                            }
+                        }
+#elif defined __linux__
+                        // perform another temperature checks here
+                        int sysfsRC = 0;
+                        sysfsRC = SYSFS_get_temperature(sysFsTemp1InputPath, &temperature);
+                        if (sysfsRC != 0)
+                        {
+                            free(sysFsTemp1InputPath);
+                            sysFsTemp1InputPath = NULL;
+
+                            applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                            goto out;
+                        }
+#endif // __linux__
+                    }
+
+                    // extra check for the throttling flag
+                    if(temperature <= gpuTemperatureLimit)
+                    {
+                        applog(LOG_WARNING, "cl_device(%d): cooled down, resuming.", thr_id);
+                        throttling = false;
+                    }
+
+                    // restart loop
+                    continue;
+                }
+            }
+
+            //---------------------------------------------------------------------
+            // Adaptive batch size
+            if (adaptiveBatchSize == true)
+            {
+                double ms = elapsedTimeMs;
+
+                size_t newBatchSize = globalWorkSize1x;
+                if(ms > maxMs)
+                {
+                    double p = ms / maxMs; // possible division by 0 is handled outside
+                    newBatchSize /= p; // possible division by 0 is handled outside
+                    newBatchSize = align_u64(newBatchSize, alignment);
+
+                    globalWorkSize1x = newBatchSize;
+                    globalWorkSize4x = newBatchSize * 4;
+
+                    if (opt_debug) { applog(LOG_DEBUG, "cl_device(%d):Worksize decreased to %zu", thr_id, newBatchSize); }
+                }
+                else if (ms < maxMs)
+                {
+                    double p = maxMs / ms; // possible division by 0 is handled outside
+                    newBatchSize *= p;
+                    newBatchSize = align_u64(newBatchSize, alignment);
+
+                    // resize buffers(if possible)
+                    if ((newBatchSize > workSize)) // workSize in this case is a buffer work size
+                    {
+                        while (maxBatchSize > minBatchSize)
+                        {
+                            if (clmemResults != NULL) {clReleaseMemObject(clmemResults); }
+                            //! hash results. can be used for full validation.
+                            clmemResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, newBatchSize * sizeof(u32x8), nullptr, &errorCode);
+                            if (errorCode == CL_SUCCESS)
+                            {
+                                // Some drivers use lazy allocation. Prove, that we have enough memory.
+                                errorCode = clEnqueueFillBuffer(clCommandQueue, clmemResults, &zero, sizeof(uint32_t), 0, (sizeof(uint32_t) * 1), 0, nullptr, nullptr);
+                            }
+
+                            if (errorCode == CL_SUCCESS)
+                            {
+                                if (clmemHTargetResults != NULL) { clReleaseMemObject(clmemHTargetResults); }
+                                clmemHTargetResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, sizeof(uint32_t) * (newBatchSize + 1), nullptr, &errorCode);
+                                if (errorCode == CL_SUCCESS)
+                                {
+                                    // Some drivers use lazy allocation. Prove, that we have enough memory.
+                                    errorCode = clEnqueueFillBuffer(clCommandQueue, clmemHTargetResults, &zero, sizeof(uint32_t), 0, (sizeof(uint32_t) * 1), 0, nullptr, nullptr);
+                                }
+
+                                if (errorCode == CL_SUCCESS)
+                                {
+#ifdef VERTHASH_FULL_VALIDATION
+                                    // resize CPU hash buffer for VERTHASH_FULL_VALIDATION
+                                    verthashIORES.resize(workSize);
+#endif
+
+                                    workSize = newBatchSize;
+
+                                    globalWorkSize1x = newBatchSize;
+                                    globalWorkSize4x = newBatchSize * 4;
+
+                                    break;
+                                }
+                                else
+                                {
+                                    if (opt_debug) { applog(LOG_DEBUG, "cl_device(%d):Failed to create an HTarget buffer, recreate with the old batch size", thr_id); }
+
+                                    // out of memory error
+                                    maxBatchSize >>= 1;
+                                    if (maxBatchSize == 0) { maxBatchSize = minBatchSize; }
+
+                                    //  failed to create a buffer, recreate with the old batch size
+                                    clmemResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, workSize * sizeof(u32x8), nullptr, &errorCode);
+                                    //  failed to create a buffer, recreate with the old batch size
+                                    clmemHTargetResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, sizeof(uint32_t) * (workSize + 1), nullptr, &errorCode);
+                                }
+                            }
+                            else
+                            {
+                                if (opt_debug) { applog(LOG_DEBUG, "cl_device(%d):Failed to create a 'result' buffer, recreating with the old batch size...", thr_id); }
+
+                                // out of memory error
+                                maxBatchSize >>= 1;
+                                if (maxBatchSize == 0) { maxBatchSize = minBatchSize; }
+
+                                clmemResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, workSize * sizeof(u32x8), nullptr, &errorCode);
+                            }
+                        }
+
+                        // Update kernel agruments for new buffers
+                        clSetKernelArg(clkernelSHA3_512_256, 0, sizeof(cl_mem), &clmemResults);
+                        clSetKernelArg(clkernelVerthash, 0, sizeof(cl_mem), &clmemResults);
+                        clSetKernelArg(clkernelVerthash, 5, sizeof(cl_mem), &clmemHTargetResults);
+
+                        if (opt_debug) { applog(LOG_DEBUG, "cl_device(%d):Kernel args and buffers have been updated for a new batchSize: %zu", thr_id, workSize); }
+                    }
+                    else
+                    {
+                        if (newBatchSize > maxBatchSize) // overflow check
+                        {
+                            maxBatchSize >>= 1;
+                            if (maxBatchSize < minBatchSize) { maxBatchSize = minBatchSize; }
+
+                            if (opt_debug) { applog(LOG_DEBUG, "cl_device(%d):Update max batch size to: %zu", thr_id, maxBatchSize); }
+                        }
+                        else
+                        {
+                            globalWorkSize1x = newBatchSize;
+                            globalWorkSize4x = newBatchSize * 4;
+
+                            if (opt_debug) { applog(LOG_DEBUG, "cl_device(%d):Worksize increased to %zu", thr_id, newBatchSize); }
+                        }
+                    }
+                }
+
+                // Handle overflow
+                uint64_t nextNonce = nonce64 + globalWorkSize1x;
+                if (nextNonce > maxNonce)
+                {
+                    globalWorkSize1x = globalWorkSize1x - (nextNonce - maxNonce);
+                    globalWorkSize4x = globalWorkSize1x*4;
+                }
+            }
+            //------------------- Adaptive batch size end ---------------------------------
+            uint32_t nonce = (uint32_t)nonce64;
+
             auto start = std::chrono::steady_clock::now();
 
             // Update first nonce parameter
@@ -1630,29 +2014,194 @@ static int verthashOpenCL_thread(void *userdata)
             if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed start pipeline. error code: %d.", thr_id, errorCode); goto out; }
 
             //-----------------------------------
-            // compute average time from samples asynchronously
+            // Asynchronous processing
             uint64_t hrSec = std::chrono::duration_cast<std::chrono::seconds>( std::chrono::steady_clock::now() - hrTimerStart ).count();
             if ((hrSec >= hrTimerIntervalSec) && (numSamples > 0))
             {
-                uint64_t avg = computeAverage(profSamples.data(), profSamples.size(), numSamples);
-                double timeSec = ((double)avg) * 0.000000001;
-                double hashesPerSec = ((double)workSize) / timeSec;
-                
-                // Mhash/s version. Not precise enough with the new algorithm version.
-                //double hs = hashesPerSec * 0.000001;
-                //applog(LOG_INFO, "cl_device(%d): hashrate: %.02f Mhash/s", thr_id, hs);
-                
-                double hs = hashesPerSec *0.001;                
-                applog(LOG_INFO, "cl_device(%d): hashrate: %.02f kH/s", thr_id, hs);
+                char sGPUTemperature[32] = {};
+                char sPower[32] = {};
+                char sFanSpeed[32] = {};
+
+                // monitoring
+                if (deviceMonitor != 0)
+                {
+                    if (nvmlDevice != NULL)
+                    {
+                        unsigned int nvmlTemperature = 0;
+                        unsigned int nvmlPower = 0;
+                        unsigned int nvmlFanSpeed = 0;
+
+                        // get data from NVML backend
+                        nvmlReturn_t nvmlRC = nvmlDeviceGetTemperature(nvmlDevice, NVML_TEMPERATURE_GPU, &nvmlTemperature);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            temperature = (int)nvmlTemperature;
+                            snprintf(sGPUTemperature, sizeof(sGPUTemperature), " temp:%dC,", temperature);
+                        }
+                        else
+                        {
+                            if(gpuTemperatureLimit != 0)
+                            {
+                                applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                                goto out;
+                            }
+                        }
+                        
+                        nvmlRC = nvmlDeviceGetPowerUsage(nvmlDevice, &nvmlPower);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            power = (int)(nvmlPower / 1000);
+                            snprintf(sPower, sizeof(sPower), " power:%dW,", power);
+                        }
+
+                        nvmlRC = nvmlDeviceGetFanSpeed(nvmlDevice, &nvmlFanSpeed);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            fanSpeed = (int)nvmlFanSpeed;
+                            snprintf(sFanSpeed, sizeof(sFanSpeed), " fan:%d%%,", fanSpeed);
+                        }
+                    }
+                    else
+                    {
+#ifdef WIN32
+                        // ADL
+                        int adlRC = ADL_OK;
+                        if (adlAdapterIndex != -1)
+                        {
+                            adlRC = ALD2_Overdrive_Temperature_Get(adlContext, adlAdapterIndex, overdriveVersion, &temperature);
+                            if (adlRC == ADL_OK)
+                            {
+                                snprintf(sGPUTemperature, sizeof(sGPUTemperature), " temp:%dC,", temperature);
+                            }
+                            else
+                            {
+                                if(gpuTemperatureLimit != 0)
+                                {
+                                    applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                                    goto out;
+                                }
+                            }
+                        }
+#elif defined __linux__
+                        // get data from SYSFS backend
+                        int sysfsRC = 0;
+                        sysfsRC = SYSFS_get_temperature(sysFsTemp1InputPath, &temperature);
+                        if (sysfsRC == 0)
+                        {
+                            snprintf(sGPUTemperature, sizeof(sGPUTemperature), " temp:%dC,", temperature);
+                        }
+                        else
+                        {
+                            free(sysFsTemp1InputPath);
+                            sysFsTemp1InputPath = NULL;
+                            if(gpuTemperatureLimit != 0)
+                            {
+                                applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                                goto out;
+                            }
+                        }
+                        
+                        sysfsRC = SYSFS_get_power_usage(sysFsPower1AveragePath, &power);
+                        if (sysfsRC == 0)
+                        {
+                            snprintf(sPower, sizeof(sPower), " power:%dW,", power);
+                        }
+                        else
+                        {
+                            free(sysFsPower1AveragePath);
+                            sysFsPower1AveragePath = NULL;
+                        }
+
+                        sysfsRC = SYSFS_get_fan_speed(sysFsPwm1Path, sysFsPwm1MaxPath, &fanSpeed);
+                        if (sysfsRC == 0)
+                        {
+                            snprintf(sFanSpeed, sizeof(sFanSpeed), " fan:%d%%,", fanSpeed);
+                        }
+                        else
+                        {
+                            free(sysFsPwm1MaxPath);
+                            sysFsPwm1MaxPath = NULL;
+                            free(sysFsPwm1Path);
+                            sysFsPwm1Path = NULL;
+                        }
+#endif // __linux__
+                    }
+                }
+
+                // compute average time from samples asynchronously
+                double avgHr = 0;
+                int t = 1;
+                for (size_t i = 0; i < numSamples; ++i)
+                {
+                    double timeSec = ((double)profSamples[i]) * 0.000000001;
+                    double hashesPerSec = ((double)batchSamples[i]) / timeSec;
+                    double hs = hashesPerSec *0.001;
+
+                    // compute avg
+                    avgHr += (hs - avgHr) / t;
+                    ++t;
+                }
+
+                applog(LOG_INFO, "cl_device(%d):%s%s%s hashrate: %.02f kH/s",
+                           thr_id, sGPUTemperature, sPower, sFanSpeed, avgHr);
 
                 // update total hash-rate
                 mtx_lock(&stats_lock);
-                thr_hashrates[thr_id] = hs;
+                thr_hashrates[thr_id] = avgHr;
                 mtx_unlock(&stats_lock);
 
                 // reset timer
                 hrTimerStart = std::chrono::steady_clock::now();
             }
+
+
+            if (deviceMonitor != 0)
+            {
+                // perform another temperature checks here
+                if (nvmlDevice != NULL)
+                {
+                    unsigned int nvmlTemperature = 0;
+                    nvmlReturn_t nvmlRC = nvmlDeviceGetTemperature(nvmlDevice, NVML_TEMPERATURE_GPU, &nvmlTemperature);
+                    if (nvmlRC == NVML_SUCCESS)
+                    {
+                        temperature = (int)nvmlTemperature;
+                    }
+                    else
+                    {
+                        applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                        goto out;
+                    }
+                }
+                else
+                {
+#ifdef _WIN32
+                    // ADL
+                    int adlRC = ADL_OK;
+                    if (adlAdapterIndex != -1)
+                    {
+                        adlRC = ALD2_Overdrive_Temperature_Get(adlContext, adlAdapterIndex, overdriveVersion, &temperature);
+                        if (adlRC != ADL_OK)
+                        {
+                            applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                            goto out;
+                        }
+                    }
+#elif defined __linux__
+                    // perform another temperature checks here
+                    int sysfsRC = 0;
+                    sysfsRC = SYSFS_get_temperature(sysFsTemp1InputPath, &temperature);
+                    if (sysfsRC != 0)
+                    {
+                        free(sysFsTemp1InputPath);
+                        sysFsTemp1InputPath = NULL;
+
+                        applog(LOG_ERR, "cl_device(%d):Failed to get temperature, when temperature limit is set. exiting.", thr_id);
+                        goto out;
+                    }
+#endif // __linux__
+                }
+            }
+
 
             //-----------------------------------
             // Wait pipeline to finish
@@ -1663,11 +2212,16 @@ static int verthashOpenCL_thread(void *userdata)
                 goto out;
             }
 
+            //-----------------------------------
+            // Handle occupancy
+            const uint64_t waitTime = (occupancy * (uint32_t)elapsedTimeMs) / 100; // prevent overflow with u64
+            if (waitTime != 0) { sleep_ms((int)waitTime); }
+
 #ifdef VERTHASH_FULL_VALIDATION
             //-------------------------------------
             // Retrieve device data
             verthashIORES.clear();
-            errorCode = clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, 0, workSize * sizeof(uvec8), verthashIORES.data(), 0, nullptr, nullptr);
+            errorCode = clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, 0, globalWorkSize1x * sizeof(u32x8), verthashIORES.data(), 0, nullptr, nullptr);
             if (errorCode != CL_SUCCESS)
             {
                 applog(LOG_ERR, "cl_device(%d):Failed to read a 'hash_result' buffer.", thr_id);
@@ -1678,13 +2232,15 @@ static int verthashOpenCL_thread(void *userdata)
             // record a profiler sample
             auto end = std::chrono::steady_clock::now();
             profSamples[sampleIndex] = std::chrono::duration<uint64_t, std::nano>(end - start).count();
+            batchSamples[sampleIndex] = (uint64_t)globalWorkSize1x;
+            elapsedTimeMs = ((double)profSamples[sampleIndex]) * 0.000001;
             sampleIndex = (sampleIndex + 1) & (profSamples.size()-1);
             ++numSamples;
             if (numSamples > profSamples.size()) { numSamples = profSamples.size(); }
 
             //-------------------------------------
             // Submit results
-            for (size_t i = 0; i < workSize; ++i)
+            for (size_t i = 0; i < globalWorkSize1x; ++i)
             {
                 if (fulltestUvec8(verthashIORES[i], workInfo.target)) 
                 {
@@ -1735,11 +2291,13 @@ static int verthashOpenCL_thread(void *userdata)
             if (potentialResultCount != 0)
             {
                 if (opt_debug)
+                {
                     applog(LOG_DEBUG, "cl_device(%d):Potential result count = %u", thr_id, potentialResultCount);
+                }
 
-                uvec8 hashResult;
+                u32x8 hashResult;
                 // get latest hash result from device
-                clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, sizeof(uvec8)*potentialResult, sizeof(uvec8), &hashResult, 0, nullptr, nullptr);
+                clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, sizeof(u32x8)*potentialResult, sizeof(u32x8), &hashResult, 0, nullptr, nullptr);
                 // test it against target
                 if (fulltestUvec8(hashResult, workInfo.target))
                 {
@@ -1763,7 +2321,7 @@ static int verthashOpenCL_thread(void *userdata)
                     for (size_t g = 0; g < numRemainingNonces; ++g)
                     {
                         // get latest hash result from device
-                        clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, sizeof(uvec8)*potentialResults[g], sizeof(uvec8), &hashResult, 0, nullptr, nullptr);
+                        clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, sizeof(u32x8)*potentialResults[g], sizeof(u32x8), &hashResult, 0, nullptr, nullptr);
 
                         if (fulltestUvec8(hashResult, workInfo.target))
                         {
@@ -1785,6 +2343,8 @@ static int verthashOpenCL_thread(void *userdata)
             // record a profiler sample
             auto end = std::chrono::steady_clock::now();
             profSamples[sampleIndex] = std::chrono::duration<uint64_t, std::nano>(end - start).count();
+            batchSamples[sampleIndex] = (uint64_t)globalWorkSize1x;
+            elapsedTimeMs = ((double)profSamples[sampleIndex]) * 0.000001;
             sampleIndex = (sampleIndex + 1) & (profSamples.size()-1);
             ++numSamples;
             if (numSamples > profSamples.size()) { numSamples = profSamples.size(); }
@@ -1794,6 +2354,11 @@ static int verthashOpenCL_thread(void *userdata)
             for (size_t i = 0; i < results.size(); ++i)
             {
                 workInfo.data[19] = results[i]; // HTarget results
+
+                if (opt_debug)
+                {
+                    applog(LOG_ERR, "cl_device(%d):Submit work(nonce: %u)", thr_id, results[i]);
+                }
 
                 if (!submit_work(mythr, &workInfo))
                 {
@@ -1826,17 +2391,13 @@ static int verthashOpenCL_thread(void *userdata)
 
 
             //-------------------------------------
-            // max runs limit
-            ++runs;
-            if (runs >= maxRuns)
+            // max nonce limit
+            nonce64 += globalWorkSize1x;
+            if (nonce64 >= maxNonce)
             {
                 applog(LOG_INFO, "cl_device(%d):Device has completed its nonce range.", thr_id);
-                fflush(stdout);
-
                 break;
             }
-            // update nonce
-            nonce += workSize;
 
         } // end is running
 
@@ -1872,6 +2433,25 @@ out:
     // misc
     if (clCommandQueue != NULL) { clReleaseCommandQueue(clCommandQueue); }
     if (clContext != NULL) { clReleaseContext(clContext); }
+
+    //-------------------------------------
+    // Free monitoing data
+#ifdef _WIN32
+    if (adlContext != NULL)
+    {
+        int adlRC = ADL2_Main_Control_Destroy(adlContext);
+        if (adlRC != ADL_OK)
+        {
+            applog(LOG_ERR, "cl_device(%d):Failed to destroy ADL context", thr_id);
+        }
+    }
+#elif defined __linux__
+
+    free(sysFsPwm1Path);
+    free(sysFsPwm1MaxPath);
+    free(sysFsPower1AveragePath);
+    free(sysFsTemp1InputPath);
+#endif // __linux__
 
     //-------------------------------------
     // Exit thread
@@ -1942,43 +2522,111 @@ extern "C" void verthash_cuda(size_t blocksPerGrid, size_t threadsPerBlock,
 struct cuworker_t
 {
     struct thr_info* threadInfo;
-    int cudevice;
+    vh::cudevice_t cudevice;
     size_t workSize;
+    uint32_t batchTimeMs;
+    uint32_t occupancyPct;
+
+    // monitoring
+    nvmlDevice_t nvmlDevice;
+    int gpuTemperatureLimit;
+    int deviceMonitor;
 };
 
 static int verthashCuda_thread(void *userdata)
 {
-    cuworker_t* cuworker = (cuworker_t*)userdata;
-    int cudevice = cuworker->cudevice;
-    int cuWorkerIndex = cuworker->threadInfo->id - cuDeviceIndexOffset; 
-    
-    //-------------------------------------
-    // num runs to reach max nonce
-    const uint64_t numNoncesGlobal = 4294967296ULL;
-    uint32_t maxRunsGlobal = (uint32_t)(numNoncesGlobal / (uint32_t)cuworker->workSize);
-    size_t workSize = cuworker->workSize;
-    // verthash kernel run configuration
-    int cudaThreadsPerBlock = 64;
-    int cudaBlocksPerGrid = (workSize + cudaThreadsPerBlock - 1) / cudaThreadsPerBlock;
+    if (opt_debug)
+    {
+        applog(LOG_DEBUG, "Verthash CUDA thread started");
+    }
 
-    //------------------------------
+    //-------------------------------------
+    // Get thread data
+    cuworker_t* cuworker = (cuworker_t*)userdata;
+    vh::cudevice_t& cudevice = cuworker->cudevice;
+    int cuWorkerIndex = cuworker->threadInfo->id - cuDeviceIndexOffset; 
     struct thr_info *mythr = cuworker->threadInfo;
     int thr_id = mythr->id;
-    struct work workInfo = { { 0 } };
     
-    const uint64_t numNoncesPerDevice = 4294967296ULL / (uint64_t)opt_n_threads;
-    uint32_t maxRunsPerDevice = (uint32_t)(numNoncesPerDevice / (uint32_t)workSize);
-    // last device
-    if (thr_id == (opt_n_threads - 1))
+    //-------------------------------------
+    // Monitoring data
+    int deviceMonitor = cuworker->deviceMonitor;
+    int gpuTemperatureLimit = cuworker->gpuTemperatureLimit;
+    bool throttling = false;
+    // stats
+    int temperature = 0;
+    int power = 0;
+    int fanSpeed = 0;
+
+    // NVML
+    nvmlDevice_t nvmlDevice = cuworker->nvmlDevice;
+    if ((nvmlDevice == NULL) && (cuworker->deviceMonitor != 0))
     {
-        maxRunsPerDevice += (uint32_t)(numNoncesPerDevice % opt_n_threads);
+        applog(LOG_WARNING, "cu_device(%d):Monitoring has been disabled. No backends available!", cuWorkerIndex);
+        deviceMonitor = 0;
     }
-    
-    uint32_t numRuns = 0;
+    //-------------------------------------
+    // Work related stuff
+    struct work workInfo = { { 0 } };
+
+    // adaptive batch size flag
+    const bool adaptiveBatchSize = (cuworker->workSize == 0)? true : false;
+
+    // batch size
+    // 4096 is a starting batch size in adaptive mode
+    size_t workSize = (adaptiveBatchSize == true)? 4096 : cuworker->workSize;
+
+    // occupancy percent(workSize must be adaptive)
+    uint32_t occupancyPct = (adaptiveBatchSize == true) ? cuworker->occupancyPct : 100;
+    // extra check to prevent 0
+    if ((occupancyPct == 0) || (occupancyPct > 100))
+    {
+        occupancyPct = 100;
+    }
+    const uint32_t occupancy = 100 - occupancyPct;
+
+    size_t globalWorkSize1x = workSize;
+
+    //-------------------------------------
+    // Init nonce range 
+    const uint64_t numNoncesGlobal = 4294967296ULL; // global nonce range is [0..4294967295]
+    const uint64_t maxBatches = (numNoncesGlobal / (uint64_t)workSize);
+    uint64_t maxBatchesPerDevice = maxBatches;
+    uint32_t firstNonce = 0;
+    uint64_t maxNonce = numNoncesGlobal; // actually last nonce is maxNonce-1
+    if (have_stratum == false) // GBT
+    {
+        // There is no extranonce2 on GBT. Split a single nonce range between workers.
+        maxBatchesPerDevice = maxBatches / opt_n_threads;
+        // begin nonce range
+        firstNonce = (maxBatchesPerDevice * workSize) * thr_id;
+        // Handle case when the number of workers is not power of 2
+        if (thr_id == (opt_n_threads - 1))
+        {
+            maxBatchesPerDevice += (maxBatches % opt_n_threads);
+        }
+        // end nonce range
+        maxNonce = maxBatchesPerDevice * workSize;
+    }
+
+    //-------------------------------------
+    // Adaptive batch size settings
+    double maxMs = (double)vh::defaultBatchTimeMs; // maxBathTime
+    if(cuworker->batchTimeMs != 0)
+    {
+        maxMs = (double)cuworker->batchTimeMs;
+    }
+    const uint64_t alignment = 256; // 256 minimum possible value (max local work size in the pipeline)
+    const size_t minBatchSize = alignment;
+    double elapsedTimeMs = maxMs; // batchTimeTimer in milliseconds
+    // Max Work(Batch)Size, that can be used during the adaptive batch size.
+    // It will be lowered automatically, in case of memory allocation errors, but will never go up.
+    size_t maxBatchSize = 134217728;
+
 
 #ifdef VERTHASH_FULL_VALIDATION
     // Host side hash storage
-    std::vector<uvec8> verthashIORES;
+    std::vector<u32x8> verthashIORES;
     verthashIORES.resize(workSize);
 #else
     // HTarg result host side storage
@@ -1987,13 +2635,15 @@ static int verthashCuda_thread(void *userdata)
 #endif
 
     // init per device profiling data
-    const size_t maxProfSamples = 32;
+    const size_t maxProfSamples = 16;
     size_t numSamples = 0;
     size_t sampleIndex = 0;
     std::vector<uint64_t> profSamples(maxProfSamples, 0);
+    std::vector<uint64_t> batchSamples(maxProfSamples, 0);
 
     // per hash-rate update timer 
     std::chrono::steady_clock::time_point hrTimerStart;
+    // Hash-rate (console)report interval in seconds
     uint64_t hrTimerIntervalSec = 4; // TODO: make configurable
     
     //------------------------------
@@ -2005,7 +2655,7 @@ static int verthashCuda_thread(void *userdata)
     uint32_t* dmemResults = NULL;
     uint32_t* dmemHTargetResults = NULL;
 
-    cuerr = cudaSetDevice(cuworker->cudevice);
+    cuerr = cudaSetDevice(cuworker->cudevice.cudeviceHandle);
     if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to assign a CUDA device to thread. error code: %d", cuWorkerIndex, cuerr); goto out; }
 
     // remove busy waiting, but reduce performance by 0.1%
@@ -2020,7 +2670,7 @@ static int verthashCuda_thread(void *userdata)
     if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to create a SHA3/Keccak states buffer. error code: %d", cuWorkerIndex, cuerr); goto out; }
 
     //! hash results
-    cuerr = cudaMalloc((void**)&dmemResults, workSize * sizeof(uvec8));
+    cuerr = cudaMalloc((void**)&dmemResults, workSize * sizeof(u32x8));
     if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to create a hash results buffer. error code: %d", cuWorkerIndex, cuerr); goto out; }
 
     //! results against hash target.
@@ -2052,8 +2702,12 @@ static int verthashCuda_thread(void *userdata)
         applog(LOG_ERR, "Verthash data is empty!"); 
     }
 
-    // print work size:
-    applog(LOG_INFO, "cu_device(%d): WorkSize has been set to: %u", cuWorkerIndex, (uint32_t)workSize);
+
+    if (adaptiveBatchSize == false)
+    {
+        // print work size:
+        applog(LOG_INFO, "cu_device(%d): WorkSize has been set to: %u", cuWorkerIndex, (uint32_t)workSize);
+    }
 
     //-------------------------------------
     // reset hash-rate reporting timer
@@ -2072,14 +2726,7 @@ static int verthashCuda_thread(void *userdata)
                 sleep_ms(1);
             }
             mtx_lock(&g_work_lock);
-            //if (memcmp(workInfo.data, g_work.data, 76))
-            {
-                stratum_gen_work(&stratum, &g_work);
-            }
-
-            maxRuns = maxRunsGlobal;
-            runs = 0;
-            nonce = 0;
+            stratum_gen_work(&stratum, &g_work);
         }
         else // GBT
         {
@@ -2095,22 +2742,19 @@ static int verthashCuda_thread(void *userdata)
             }
 
             g_work_time = time(NULL);
-
-            const uint32_t offsetN = (maxRunsPerDevice * workSize)*thr_id;
-            const uint32_t first_nonce = offsetN + (numRuns * workSize);
-
-            maxRuns = maxRunsPerDevice;
-            runs = 0;
-            nonce = first_nonce;
         }
 
         // create a work copy
         work_free(&workInfo);
         work_copy(&workInfo, &g_work);
-        workInfo.data[19] = 0; // TODO: needed?
+        workInfo.data[19] = 0;
+        work_restart[thr_id].restart = 0;
 
         mtx_unlock(&g_work_lock);
-        work_restart[thr_id].restart = 0;
+
+        // Actual nonce is 32 bit, but we use 64 bit to prevent possible overflows
+        uint64_t nonce64 = firstNonce;
+
 
 #ifdef VERTHASH_EXTENDED_VALIDATION
         uint64_t wtarget = ((uint64_t(workInfo.target[7])) << 32) | (uint64_t(workInfo.target[6]) & 0xFFFFFFFFUL);
@@ -2119,7 +2763,6 @@ static int verthashCuda_thread(void *userdata)
 #endif
         //-------------------------------------
         // Generate midstate
-        // TODO: optimize. Check on every new block
         uint32_t uheader[20] = {0};
         for (size_t i = 0; i < 20; ++i)
         {
@@ -2159,11 +2802,6 @@ static int verthashCuda_thread(void *userdata)
         cuerr = cudaDeviceSynchronize();
         if (cuerr != cudaSuccess) { applog(LOG_ERR, "Device not responding. cu_device(%d) error code: %d", cuWorkerIndex, cuerr); goto out; }
 
-
-        // TODO: sort runs and nonce is the same, but different metrics
-        //uint32_t runs = 0;
-        //uint32_t nonce = 0;
-
         //-------------------------------------
         // Compute hashes
 
@@ -2171,7 +2809,177 @@ static int verthashCuda_thread(void *userdata)
         // in case program termination was triggered between work generation and resetting work restart values
         while (!work_restart[thr_id].restart && (!abort_flag))
         {
-            //printf("tid %d, First nonce: %u, maxRuns: %u\n", thr_id, nonce, maxRuns);
+            //---------------------------------------------------------------------
+            // Temperature limit
+            // 0 means handled by the device driver. This check is still required in case backend reports wrong temp.
+            if ((gpuTemperatureLimit != 0) && (deviceMonitor != 0))
+            {
+                if (temperature > gpuTemperatureLimit)
+                {
+                    if (throttling == false)
+                    {
+                        throttling = true;
+                        applog(LOG_WARNING, "cu_device(%d): gpu temperature limit has reached %dC(max:%uC), stopping.", cuWorkerIndex, temperature, gpuTemperatureLimit);
+                    }
+                    // throttling
+                    const int waitTimeMs = 100;
+                    sleep_ms(waitTimeMs);
+
+                    // emit empty sample(
+                    profSamples[sampleIndex] = (uint64_t)waitTimeMs;
+                    batchSamples[sampleIndex] = 0;
+                    sampleIndex = (sampleIndex + 1) & (profSamples.size()-1);
+                    ++numSamples;
+                    if (numSamples > profSamples.size())
+                    {
+                        numSamples = profSamples.size();
+                    }
+
+                    // perform another temperature checks here
+                    if (nvmlDevice != NULL)
+                    {
+                        unsigned int nvmlTemperature = 0;
+                        nvmlReturn_t nvmlRC = nvmlDeviceGetTemperature(nvmlDevice, NVML_TEMPERATURE_GPU, &nvmlTemperature);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            temperature = (int)nvmlTemperature;
+                        }
+                        else
+                        {
+                            applog(LOG_ERR, "cu_device(%d):Failed to get temperature, when temperature limit is set. exiting.", cuWorkerIndex);
+                            goto out;
+                        }
+                    }
+
+                    // extra check for the throttling flag
+                    if(temperature <= gpuTemperatureLimit)
+                    {
+                        applog(LOG_WARNING, "cu_device(%d): cooled down, resuming.", cuWorkerIndex);
+                        throttling = false;
+                    }
+
+                    // restart loop
+                    continue;
+                }
+            }
+
+            //---------------------------------------------------------------------
+            // Adaptive batch size
+            //---------------------------------------------------------------------
+            if (adaptiveBatchSize == true)
+            {
+                double ms = elapsedTimeMs;
+
+                size_t newBatchSize = globalWorkSize1x;
+                if(ms > maxMs)
+                {
+                    double p = ms / maxMs; // possible division by 0 is handled outside
+                    newBatchSize /= p; // possible division by 0 is handled outside
+                    newBatchSize = align_u64(newBatchSize, alignment);
+
+                    globalWorkSize1x = newBatchSize;
+
+                    if (opt_debug) { applog(LOG_DEBUG, "cu_device(%d):Worksize decreased to %zu", cuWorkerIndex, newBatchSize); }
+                }
+                else if (ms < maxMs)
+                {
+                    double p = maxMs / ms; // possible division by 0 is handled outside
+                    newBatchSize *= p;
+                    newBatchSize = align_u64(newBatchSize, alignment);
+
+                    // resize buffers(if possible)
+                    if ((newBatchSize > workSize)) // workSize in this case is a buffer work size
+                    {
+                        while (maxBatchSize > minBatchSize)
+                        {
+                            if (dmemResults != NULL) { cudaFree(dmemResults); }
+                            cuerr = cudaMalloc((void**)&dmemResults, newBatchSize * sizeof(u32x8));
+                            if (cuerr == cudaSuccess)
+                            {
+                                // Some drivers use lazy allocation. Prove, that we have enough memory.
+                                cuerr = cudaMemset(dmemResults, 0, (sizeof(uint32_t) * 1));
+                            }
+
+                            if (cuerr == cudaSuccess)
+                            {
+                                if (dmemHTargetResults != NULL) { cudaFree(dmemHTargetResults); }
+                                cuerr = cudaMalloc((void**)&dmemHTargetResults, sizeof(uint32_t) * (newBatchSize + 1));
+                                if (cuerr == cudaSuccess)
+                                {
+                                    // Some drivers use lazy allocation. Prove, that we have enough memory.
+                                    cuerr = cudaMemset(dmemHTargetResults, 0, (sizeof(uint32_t) * 1));
+                                }
+
+                                if (cuerr == cudaSuccess)
+                                {
+#ifdef VERTHASH_FULL_VALIDATION
+                                    // resize CPU hash buffer for VERTHASH_FULL_VALIDATION
+                                    verthashIORES.resize(workSize);
+#endif
+
+                                    workSize = newBatchSize;
+                                    globalWorkSize1x = newBatchSize;
+                                    break;
+                                }
+                                else
+                                {
+                                    if (opt_debug) { applog(LOG_DEBUG, "cu_device(%d):Failed to create an HTarget buffer, recreate with the old batch size", cuWorkerIndex); }
+
+                                    // out of memory error
+                                    maxBatchSize >>= 1;
+                                    if (maxBatchSize == 0) { maxBatchSize = minBatchSize; }
+
+                                    //  failed to create a buffer, recreate with the old batch size
+                                    cudaMalloc((void**)&dmemResults, workSize * sizeof(u32x8));
+                                    //  failed to create a buffer, recreate with the old batch size
+                                    cudaMalloc((void**)&dmemHTargetResults, sizeof(uint32_t) * (workSize + 1));
+                                }
+                            }
+                            else
+                            {
+                                if (opt_debug) { applog(LOG_DEBUG, "cu_device(%d):Failed to create a 'result' buffer, recreating with the old batch size...", cuWorkerIndex); }
+
+                                // out of memory error
+                                maxBatchSize >>= 1;
+                                if (maxBatchSize == 0) { maxBatchSize = minBatchSize; }
+
+                                cudaMalloc((void**)&dmemResults, workSize * sizeof(u32x8));
+                            }
+                        }
+
+                        if (opt_debug) { applog(LOG_DEBUG, "cu_device(%d): Buffers have been updated for a new batchSize: %zu", cuWorkerIndex, workSize); }
+                    }
+                    else
+                    {
+                        if (newBatchSize > maxBatchSize) // overflow check
+                        {
+                            maxBatchSize >>= 1;
+                            if (maxBatchSize < minBatchSize) { maxBatchSize = minBatchSize; }
+
+                            if (opt_debug) { applog(LOG_DEBUG, "cu_device(%d): Update max batch size to: %zu", cuWorkerIndex, maxBatchSize); }
+                        }
+                        else
+                        {
+                            globalWorkSize1x = newBatchSize;
+
+                            if (opt_debug) { applog(LOG_DEBUG, "cu_device(%d): Worksize increased to %zu", cuWorkerIndex, newBatchSize); }
+                        }
+                    }
+                }
+
+                // Handle overflow
+                uint64_t nextNonce = nonce64 + globalWorkSize1x;
+                if (nextNonce > maxNonce)
+                {
+                    globalWorkSize1x = globalWorkSize1x - (nextNonce - maxNonce);
+                }
+            }
+            //------------------- Adaptive batch size end ---------------------------------
+            uint32_t nonce = (uint32_t)nonce64;
+
+            // verthash kernel run configuration
+            int cudaThreadsPerBlock = 64;
+            int cudaBlocksPerGrid = (globalWorkSize1x + cudaThreadsPerBlock - 1) / cudaThreadsPerBlock;
 
             auto start = std::chrono::steady_clock::now();
 
@@ -2190,27 +2998,102 @@ static int verthashCuda_thread(void *userdata)
 #endif
 
             //-----------------------------------
-            // compute average time from samples asynchronously
+            // Asynchronous processing
             uint64_t hrSec = std::chrono::duration_cast<std::chrono::seconds>( std::chrono::steady_clock::now() - hrTimerStart ).count();
             if ((hrSec >= hrTimerIntervalSec) && (numSamples > 0))
             {
-                uint64_t avg = computeAverage(profSamples.data(), profSamples.size(), numSamples);
-                double timeSec = ((double)avg) * 0.000000001;
-                double hashesPerSec = ((double)workSize) / timeSec;
-                //double hs = hashesPerSec * 0.000001;
-                //applog(LOG_INFO, "cu_device(%d): hashrate: %.02f Mhash/s", thr_id, hs);
+                char sGPUTemperature[32] = {};
+                char sPower[32] = {};
+                char sFanSpeed[32] = {};
 
-                double hs = hashesPerSec * 0.001;
-                applog(LOG_INFO, "cu_device(%d): hashrate: %.02f kH/s", thr_id, hs);
+                // monitoring
+                if (deviceMonitor != 0)
+                {
+                    if (nvmlDevice != NULL)
+                    {
+                        unsigned int nvmlTemperature = 0;
+                        unsigned int nvmlPower = 0;
+                        unsigned int nvmlFanSpeed = 0;
+
+                        // get data from NVML backend
+                        nvmlReturn_t nvmlRC = nvmlDeviceGetTemperature(nvmlDevice, NVML_TEMPERATURE_GPU, &nvmlTemperature);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            temperature = (int)nvmlTemperature;
+                            snprintf(sGPUTemperature, sizeof(sGPUTemperature), " temp:%dC,", temperature);
+                        }
+                        else
+                        {
+                            if(gpuTemperatureLimit != 0)
+                            {
+                                applog(LOG_ERR, "cu_device(%d):Failed to get temperature, when temperature limit is set. exiting.", cuWorkerIndex);
+                                goto out;
+                            }
+                        }
+
+                        nvmlRC = nvmlDeviceGetPowerUsage(nvmlDevice, &nvmlPower);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            power = (int)(nvmlPower / 1000);
+                            snprintf(sPower, sizeof(sPower), " power:%dW,", power);
+                        }
+
+                        nvmlRC = nvmlDeviceGetFanSpeed(nvmlDevice, &nvmlFanSpeed);
+                        if (nvmlRC == NVML_SUCCESS)
+                        {
+                            fanSpeed = (int)nvmlFanSpeed;
+                            snprintf(sFanSpeed, sizeof(sFanSpeed), " fan:%d%%,", fanSpeed);
+                        }
+                    }
+                }
+
+
+
+                // compute average time from samples asynchronously
+                double avgHr = 0;
+                int t = 1;
+                for (size_t i = 0; i < numSamples; ++i)
+                {
+                    double timeSec = ((double)profSamples[i]) * 0.000000001;
+                    double hashesPerSec = ((double)batchSamples[i]) / timeSec;
+                    double hs = hashesPerSec *0.001;
+                    // compute avg
+                    avgHr += (hs - avgHr) / t;
+                    ++t;
+                }
+
+                applog(LOG_INFO, "cu_device(%d):%s%s%s hashrate: %.02f kH/s",
+                           cuWorkerIndex, sGPUTemperature, sPower, sFanSpeed, avgHr);
 
                 // update total hash-rate
                 mtx_lock(&stats_lock);
-                thr_hashrates[thr_id] = hs;
+                thr_hashrates[thr_id] = avgHr;
                 mtx_unlock(&stats_lock);
 
                 // reset timer
                 hrTimerStart = std::chrono::steady_clock::now();
             }
+
+
+            if (deviceMonitor != 0)
+            {
+                // get data from NVML backend
+                unsigned int nvmlTemperature = 0;
+                nvmlReturn_t nvmlRC = nvmlDeviceGetTemperature(nvmlDevice, NVML_TEMPERATURE_GPU, &nvmlTemperature);
+                if (nvmlRC == NVML_SUCCESS)
+                {
+                    temperature = (int)nvmlTemperature;
+                }
+                else
+                {
+                    if(gpuTemperatureLimit != 0)
+                    {
+                        applog(LOG_ERR, "cu_device(%d):Failed to get temperature, when temperature limit is set. exiting.", cuWorkerIndex);
+                        goto out;
+                    }
+                }
+            }
+
 
             //-----------------------------------
             // Wait pipeline to finish
@@ -2221,18 +3104,24 @@ static int verthashCuda_thread(void *userdata)
                 goto out;
             }
 
+            //-----------------------------------
+            // Handle occupancy
+            const uint64_t waitTime = (occupancy * (uint32_t)elapsedTimeMs) / 100; // prevent overflow with u64
+            if (waitTime != 0) { sleep_ms((int)waitTime); }
 
 #ifdef VERTHASH_FULL_VALIDATION
             //-------------------------------------
             // Retrieve device data
             verthashIORES.clear();
-            cuerr = cudaMemcpy(verthashIORES.data(), dmemResults, workSize * sizeof(uvec8), cudaMemcpyDeviceToHost);
+            cuerr = cudaMemcpy(verthashIORES.data(), dmemResults, globalWorkSize1x * sizeof(u32x8), cudaMemcpyDeviceToHost);
             if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to download hash data. error code: %d", cuWorkerIndex, cuerr); goto out; }
 
             //-------------------------------------
             // Record a profiler sample
             auto end = std::chrono::steady_clock::now();
             profSamples[sampleIndex] = std::chrono::duration<uint64_t, std::nano>(end - start).count();
+            batchSamples[sampleIndex] = (uint64_t)globalWorkSize1x;
+            elapsedTimeMs = ((double)profSamples[sampleIndex]) * 0.000001;
             sampleIndex = (sampleIndex + 1) & (profSamples.size()-1);
             ++numSamples;
             if (numSamples > profSamples.size()) { numSamples = profSamples.size(); }
@@ -2289,9 +3178,9 @@ static int verthashCuda_thread(void *userdata)
                 if(opt_debug)
                     applog(LOG_DEBUG, "cu_device(%d):Potential result count = %u", cuWorkerIndex, potentialResultCount);
 
-                uvec8 hashResult;
+                u32x8 hashResult;
                 // get latest hash result from device
-                cuerr = cudaMemcpy(&hashResult, dmemResults+(potentialResult*8), sizeof(uvec8), cudaMemcpyDeviceToHost);
+                cuerr = cudaMemcpy(&hashResult, dmemResults+(potentialResult*8), sizeof(u32x8), cudaMemcpyDeviceToHost);
                 if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to get a potential hash result. error code: %d", cuWorkerIndex, cuerr); goto out; }
                 // test it against target
                 if (fulltestUvec8(hashResult, workInfo.target))
@@ -2316,7 +3205,7 @@ static int verthashCuda_thread(void *userdata)
                     for (size_t g = 0; g < numRemainingNonces; ++g)
                     {
                         // get latest hash result from device
-                        cuerr = cudaMemcpy(&hashResult, dmemResults+(potentialResults[g]*8), sizeof(uvec8), cudaMemcpyDeviceToHost);
+                        cuerr = cudaMemcpy(&hashResult, dmemResults+(potentialResults[g]*8), sizeof(u32x8), cudaMemcpyDeviceToHost);
                         if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to get a potential hash result(%llu). error code: %d", cuWorkerIndex, cuerr, (uint64_t)g); goto out; }
 
                         if (fulltestUvec8(hashResult, workInfo.target))
@@ -2338,6 +3227,8 @@ static int verthashCuda_thread(void *userdata)
             // Record a profiler sample
             auto end = std::chrono::steady_clock::now();
             profSamples[sampleIndex] = std::chrono::duration<uint64_t, std::nano>(end - start).count();
+            batchSamples[sampleIndex] = (uint64_t)globalWorkSize1x;
+            elapsedTimeMs = ((double)profSamples[sampleIndex]) * 0.000001;
             sampleIndex = (sampleIndex + 1) & (profSamples.size()-1);
             ++numSamples;
             if (numSamples > profSamples.size()) { numSamples = profSamples.size(); }
@@ -2377,17 +3268,14 @@ static int verthashCuda_thread(void *userdata)
             results.clear();
 #endif // HTarget result tests
 
-
             //-------------------------------------
-            // max runs limit
-            ++runs;
-            if (runs >= maxRuns)
+            // max nonce limit
+            nonce64 += globalWorkSize1x;
+            if (nonce64 >= maxNonce)
             {
                 applog(LOG_INFO, "cu_device(%d):Device has completed its nonce range!!!", cuWorkerIndex);
                 break;
             }
-            // update nonce
-            nonce += workSize;
 
         } // end is running
 
@@ -2621,7 +3509,9 @@ static int stratum_thread(void *userdata)
 
     stratum.url = (char*)tq_pop(mythr->q, NULL);
     if (!stratum.url)
+    {
         goto out;
+    }
     applog(LOG_INFO, "Starting Stratum on %s", stratum.url);
 
     while (!abort_flag)
@@ -2632,9 +3522,9 @@ static int stratum_thread(void *userdata)
         {
             mtx_lock(&g_work_lock);
             g_work_time = 0;
-            mtx_unlock(&g_work_lock);
             restart_threads();
-
+            mtx_unlock(&g_work_lock);
+            
             if (!stratum_connect(&stratum, stratum.url) ||
                 !stratum_subscribe(&stratum) ||
                 !stratum_authorize(&stratum, rpc_user, rpc_pass)) {
@@ -2658,26 +3548,29 @@ static int stratum_thread(void *userdata)
             }
         }
 
-        if (stratum.job.job_id &&
-            (!g_work_time || strcmp(stratum.job.job_id, g_work.job_id)))
+        int jobIDsNotEq = 1;
+        if ((g_work.job_id != NULL) && (stratum.job.job_id != NULL))
+        {
+            jobIDsNotEq = strcmp(stratum.job.job_id, g_work.job_id);
+        }
+
+        if ((g_work_time == 0) || (jobIDsNotEq != 0))
         {
             mtx_lock(&g_work_lock);
-            stratum_gen_work(&stratum, &g_work);
 
             // Due to session restore feature, first mining.notify message may not request miner to clean previous jobs.
             // Thus 0 block height check is needed here too.
             if (stratum.job.clean)
             {
                 uint32_t blockHeight = stratum_get_block_height(&stratum);
-                applog(LOG_INFO, "Verthash block: %u", blockHeight);
-
-                if (opt_debug)
+                if (stratum.blockHeight != blockHeight)
                 {
-                    applog(LOG_DEBUG, "Stratum requested work restart");
+                    stratum.blockHeight = blockHeight;
+                    applog(LOG_INFO, "Verthash block: %u", blockHeight);
                 }
-
-                restart_threads();
             }
+
+            restart_threads();
 
             time(&g_work_time);
             mtx_unlock(&g_work_lock);
@@ -2749,6 +3642,10 @@ struct cmd_device_select_t
 {
     uint32_t deviceIndex;
     uint32_t workSize;
+    uint32_t batchTimeMs;
+    uint32_t occupancyPct;
+    int gpuTemperatureLimit;
+    int deviceMonitor;
 };
 
 struct cmd_result_t
@@ -2758,7 +3655,6 @@ struct cmd_result_t
 
     // automatic config generation
     bool generateConfigFile;
-    bool rawDeviceList;
     char* generateConfigFileName;
 
     // select config file
@@ -2807,7 +3703,6 @@ inline void cmd_result_init(cmd_result_t* cmdr)
     cmdr->printDeviceList = false;
 
     cmdr->generateConfigFile = false;
-    cmdr->rawDeviceList = false;
     cmdr->generateConfigFileName = NULL;
 
     cmdr->useConfigFile = false;
@@ -2896,8 +3791,6 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
         case 'l':
             cmdr->printDeviceList = true;
             break;
-        case 'G':
-            cmdr->rawDeviceList = true;
         case 'g':
             cmdr->generateConfigFile = true;
             free(cmdr->generateConfigFileName); 
@@ -2957,7 +3850,11 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
                // printf("\t Select device: %s\n", tokenBase);
                 size_t paramIndex = 0;
                 cmd_device_select_t sel; 
-                sel.workSize = vh::defaultWorkSize; // default work size
+                sel.workSize = vh::defaultWorkSize;
+                sel.batchTimeMs = vh::defaultBatchTimeMs;
+                sel.deviceMonitor = vh::defaultDeviceMonitor;
+                sel.gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
+                sel.occupancyPct = vh::defaultOccupancyPct;
                 while (0 != (token = strsep(&tokenBase, delims2)) && (paramIndex < 2))
                 {
                     if (paramIndex == 0)
@@ -2974,6 +3871,31 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
                                 size_t len = strlen(token);
                                 if (len > 1) { sel.workSize = std::stoul(token + 1, nullptr, 0); }
                             } break;
+                        case 'b':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.batchTimeMs = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 'm':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.deviceMonitor = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 't':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.gpuTemperatureLimit = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 'o':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.occupancyPct = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        default:
+                            {
+                                fprintf(stderr, "Unknown prefix '%c'. Device settings must be specified prefix:\n", t);
+                                fprintf(stderr, "Example: 0:w131072:m1 Select device 0, set workSize to 131072 and enable monitoring\n");
+                            } break;
                         }
                     }
 
@@ -2988,7 +3910,11 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
             {
                 size_t paramIndex = 0;
                 cmd_device_select_t sel; 
-                sel.workSize = vh::defaultWorkSize; // default work size
+                sel.workSize = vh::defaultWorkSize;
+                sel.batchTimeMs = vh::defaultBatchTimeMs;
+                sel.deviceMonitor = vh::defaultDeviceMonitor;
+                sel.gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
+                sel.occupancyPct = vh::defaultOccupancyPct;
                 while (0 != (token = strsep(&tokenBase, delims2)) && (paramIndex < 2))
                 {
                     if (paramIndex == 0)
@@ -3004,6 +3930,31 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
                             {
                                 size_t len = strlen(token);
                                 if (len > 1) { sel.workSize = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 'b':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.batchTimeMs = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 'm':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.deviceMonitor = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 't':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.gpuTemperatureLimit = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        case 'o':
+                            {
+                                size_t len = strlen(token);
+                                if (len > 1) { sel.occupancyPct = std::stoul(token + 1, nullptr, 0); }
+                            } break;
+                        default:
+                            {
+                                fprintf(stderr, "Unknown prefix '%c'. Device settings must be specified prefix:\n", t);
+                                fprintf(stderr, "Example: 0:w131072:m1 Select device 0, set workSize to 131072 and enable monitoring\n");
                             } break;
                         }
                     }
@@ -3090,8 +4041,7 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
             pk_script_size = address_to_script(pk_script, sizeof(pk_script), arg);
             if (!pk_script_size)
             {
-                fprintf(stderr, "Error: %s: invalid address -- '%s'\n",
-                       pname, arg);
+                fprintf(stderr, "Error: %s: invalid address -- '%s'\n", pname, arg);
                 cmdr->overwrite_coinbaseAddr = false;
             }
             break;
@@ -3284,7 +4234,6 @@ int utf8_main(int argc, char *argv[])
     //-------------------------------------
     // OpenCL init
     // get raw device list options, which can be modified later depending on supported extensions
-    bool rawDeviceList = cmdr.rawDeviceList;
     cl_int errorCode = CL_SUCCESS;
     //-------------------------------------
     // get platform IDs
@@ -3313,7 +4262,6 @@ int utf8_main(int argc, char *argv[])
     // AMDCL2(Windows) and ROCm.(Mesa and others are listed as V_Other)
     const std::string platformVendorAMD("Advanced Micro Devices");
     const std::string platformVendorNV("NVIDIA Corporation");
-    // logical device list sorted by PCIe bus ID
     std::vector<vh::cldevice_t> cldevices;
     for (size_t i = 0; i < (size_t)numCLPlatformIDs; ++i)
     {
@@ -3330,11 +4278,6 @@ int utf8_main(int argc, char *argv[])
         }
         else if (infoString.find(platformVendorNV) != std::string::npos) 
         {
-            if (cmdr.restrictNVGPUToCUDA)
-            {
-                applog(LOG_WARNING, "Skipping CL platform (index: %u, %s)", i, infoString.c_str());
-                continue;
-            }
             vendor = vh::V_NVIDIA;
         }
 
@@ -3368,15 +4311,11 @@ int utf8_main(int argc, char *argv[])
         clu_device_topology_amd topology;
         for (size_t j = 0; j < deviceIds.size(); ++j)
         {
-            vh::cldevice_t cldevice;
-            cldevice.clPlatformId = clplatformIds[i];
-            cldevice.clId = deviceIds[j];
-            cldevice.platformIndex = (int32_t)i;
-            cldevice.binaryFormat = vh::BF_None;
-            cldevice.asmProgram = vh::AP_None;
-            cldevice.vendor = vendor;
+            int32_t pcieBusId = -1;
+            int32_t pcieDeviceId = -1;
+            int32_t pcieFunctionId = -1;
         
-            if (cldevice.vendor == vh::V_AMD)
+            if (vendor == vh::V_AMD)
             {
                 cl_int status = clGetDeviceInfo(deviceIds[j], CL_DEVICE_TOPOLOGY_AMD,
                                                 sizeof(clu_device_topology_amd), &topology, nullptr);
@@ -3384,53 +4323,85 @@ int utf8_main(int argc, char *argv[])
                 {
                     if (topology.raw.type == CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD)
                     {
-                        cldevice.pcieBusId = (int32_t)topology.pcie.bus;
+                        pcieBusId = (int32_t)topology.pcie.bus;
+                        pcieDeviceId = (int32_t)topology.pcie.device;
+                        pcieFunctionId = (int32_t)topology.pcie.function;
                     }
                 }
                 else // if extension is not supported
                 {
                     applog(LOG_WARNING, "Failed to get CL_DEVICE_TOPOLOGY_AMD info"
                                         "(possibly unsupported extension). Platform index: %u", i);
-                    cldevice.pcieBusId = -1;
-                    // fallback to raw device list
-                    rawDeviceList = true;
                 }
             }
-            else if (cldevice.vendor == vh::V_NVIDIA) 
+            else if (vendor == vh::V_NVIDIA)
             {
-                cl_int nvpciBus = -1;
-                cl_int status = clGetDeviceInfo(deviceIds[j], 0x4008, sizeof(cl_int), &nvpciBus, NULL);
-                if(status == CL_SUCCESS)
+#ifdef HAVE_CUDA
+                // Handle Nvidia GPU to CUDA restrictions
+                if (cmdr.restrictNVGPUToCUDA)
                 {
-                    cldevice.pcieBusId = (int32_t)nvpciBus;
+                    // If device compute capability is not supported by CUDA backend,
+                    // transfer to OpenCL
+                    cl_int nvCCMajor = -1;
+                    cl_int status0 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(cl_int), &nvCCMajor, NULL);
+                    cl_int nvCCMinor = -1;
+                    cl_int status1 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(cl_int), &nvCCMinor, NULL);
+                    if((status0 == CL_SUCCESS) && (status1 == CL_SUCCESS))
+                    {
+                        // CUDA 11 or higher
+                        if (CUDART_VERSION >= 11000)
+                        {
+                            // CUDA 11 removed SM 3.0 support.
+                            // Transfer SM 3.0 to the OpenCL backend
+                            if (!((nvCCMajor == 3) && (nvCCMinor == 0)))
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                }
+#endif
+                cl_int nvpciBus = -1;
+                cl_int status0 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_PCI_BUS_ID_NV, sizeof(cl_int), &nvpciBus, NULL);
+                cl_int nvpciSlot = -1;
+                cl_int status1 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_PCI_SLOT_ID_NV, sizeof(cl_int), &nvpciSlot, NULL);
+                cl_int nvpciDomain = -1;
+                cl_int status2 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_PCI_DOMAIN_ID_NV, sizeof(cl_int), &nvpciDomain, NULL);
+                if((status0 == CL_SUCCESS) && (status1 == CL_SUCCESS) && (status2 == CL_SUCCESS))
+                {
+                    pcieBusId = (int32_t)nvpciBus;
+                    pcieDeviceId = (int32_t)nvpciSlot;
+                    pcieFunctionId = (int32_t)nvpciDomain;
                 }
                 else
                 {
-                    applog(LOG_WARNING, "Failed to get NV_PCIE_BUS_ID info"
+                    applog(LOG_WARNING, "Failed to get NV_PCIE info"
                                         "(possibly unsupported extension). Platform index: %u", i);
-                    cldevice.pcieBusId = -1;
-                    // fallback to raw device list
-                    rawDeviceList = true;
                 }
             }
             else // V_OTHER
             {
-                cldevice.pcieBusId = -1;
-                // fallback to raw device list
-                rawDeviceList = true;
+                // NO PCIe info extensions available
             }
-                
+
+            vh::cldevice_t cldevice;
+            cldevice.clPlatformId = clplatformIds[i];
+            cldevice.clId = deviceIds[j];
+            cldevice.platformIndex = (int32_t)i;
+            cldevice.binaryFormat = vh::BF_None;
+            cldevice.asmProgram = vh::AP_None;
+            cldevice.vendor = vendor;
+            cldevice.pcieBusId = pcieBusId;
+            cldevice.pcieDeviceId = pcieDeviceId;
+            cldevice.pcieFunctionId = pcieFunctionId;
+
             cldevices.push_back(cldevice);
         }
     }
 
     if(numCLPlatformIDs > 0)
     {
-        //-----------------------------------------------------------------------------
-        // sort device list based on pcieBusID -> platformID
-        std::sort(cldevices.begin(), cldevices.end(), vh::compareLogicalDevices);
-
-        applog(LOG_INFO, "Found %llu OpenCL devices.", (uint64_t)cldevices.size());
+        applog(LOG_INFO, "Found %" PRIu64 " OpenCL devices.", (uint64_t)cldevices.size());
     }
 
 #ifdef HAVE_CUDA
@@ -3438,9 +4409,61 @@ int utf8_main(int argc, char *argv[])
     // CUDA init
     int cudeviceListSize = 0;
     cudaError_t cuerr = cudaGetDeviceCount(&cudeviceListSize);
+
+    std::vector<vh::cudevice_t> cudevices;
     if (cuerr == cudaSuccess)
     {
-        applog(LOG_INFO, "Found %d CUDA devices", cudeviceListSize);
+        for (int i = 0; i < cudeviceListSize; ++i)
+        {
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, i);
+
+            // Skip SM 3.0 devices
+            if (CUDART_VERSION >= 11000)
+            {
+                // SM 3.0 has been removed in CUDA 11
+                if ((prop.major == 3) && (prop.minor == 0))
+                {
+                    applog(LOG_WARNING, "Unsupported SM %d.%d device %s has been transfered to the OpenCL backend",
+                           prop.major, prop.minor, prop.name);
+                    applog(LOG_WARNING, "To use this device on CUDA backend, software must be compiled with CUDA 10.2 or lower!");
+
+                    continue;
+                }
+                else if (CUDART_VERSION > 8000)
+                {
+                    // SM 2.0 and 2.1 have been removed in CUDA 9
+                    if ((prop.major == 2) && ((prop.minor == 1) || (prop.minor == 0)))
+                    {
+                        applog(LOG_WARNING, "Found an unsupported SM %d.%d device: %s. Skipping...",
+                               prop.major, prop.minor, prop.name);
+                        applog(LOG_WARNING, "To use this device on CUDA backend, software must be compiled with CUDA 8.0 or lower!");
+
+                        continue;
+                    }
+                }
+            }
+
+            // SM 1.x is not supported
+            if ((prop.major == 1) && ((prop.minor == 3) || (prop.minor == 2) || (prop.minor == 1) || (prop.minor == 0)))
+            {
+                applog(LOG_WARNING, "Found an unsupported SM %d.%d device: %s. Skipping...",
+                       prop.major, prop.minor, prop.name);
+
+                continue;
+            }
+
+
+            vh::cudevice_t cudevice;
+            cudevice.cudeviceHandle = i;
+            cudevice.pcieBusId = prop.pciBusID;
+            cudevice.pcieDeviceId = prop.pciDeviceID;
+            cudevice.pcieFunctionId = prop.pciDomainID;
+
+            cudevices.push_back(cudevice);
+        }
+
+        applog(LOG_INFO, "Found %" PRIu64 " CUDA devices", (uint64_t)cudevices.size());
     }
     else
     {
@@ -3460,7 +4483,7 @@ int utf8_main(int argc, char *argv[])
 
     if (cmdr.printDeviceList)
     {
-        puts("\nDevice list(raw):");
+        puts("\nDevice list:");
         puts("==================");
 
         // print OpenCL devices
@@ -3486,11 +4509,24 @@ int utf8_main(int argc, char *argv[])
                 clGetPlatformInfo(cldevices[i].clPlatformId, CL_PLATFORM_VENDOR, infoSize, (void *)infoString1.data(), NULL);
                 infoString1.pop_back();
 
+
+                char pcieStr[16] = { };
+                if (cldevices[i].pcieBusId == -1)
+                {
+                    snprintf (pcieStr, 15, "not avilable");
+                }
+                else
+                {
+                    snprintf (pcieStr, 15, "%02x:%02x:%01x",
+                              cldevices[i].pcieBusId, cldevices[i].pcieDeviceId, cldevices[i].pcieFunctionId);
+                }
+
+
                 printf("\tIndex: %u. Name: %s\n\t"
                     "          Platform index: %u\n\t"
                     "          Platform name: %s\n\t"
-                    "          pcieBusId: %d\n\n",
-                    (uint32_t)i, infoString0.c_str(), cldevices[i].platformIndex, infoString1.c_str(), cldevices[i].pcieBusId);
+                    "          pcieId: %s\n\n",
+                    (uint32_t)i, infoString0.c_str(), cldevices[i].platformIndex, infoString1.c_str(), pcieStr);
             }
         }
         else
@@ -3500,14 +4536,26 @@ int utf8_main(int argc, char *argv[])
 #ifdef HAVE_CUDA
         // print CUDA devices
         
-        if (cudeviceListSize > 0)
+        if (cudevices.size() != 0)
         {
             puts("CUDA devices:");
-            for (int i = 0; i < cudeviceListSize; ++i)
+            for (size_t i = 0; i < cudevices.size(); ++i)
             {
-                cudaDeviceProp cudeviceProp;
-                cudaGetDeviceProperties(&cudeviceProp, i);
-                printf("\tIndex: %d. Name: %s\n", i, cudeviceProp.name);
+                cudaDeviceProp prop;
+                cudaGetDeviceProperties(&prop, cudevices[i].cudeviceHandle);
+
+                char pcieStr[16] = { };
+                if (cudevices[i].pcieBusId == -1)
+                {
+                    snprintf (pcieStr, 15, "not avilable");
+                }
+                else
+                {
+                    snprintf (pcieStr, 15, "%02x:%02x:%01x",
+                              cudevices[i].pcieBusId, cudevices[i].pcieDeviceId, cudevices[i].pcieFunctionId);
+                }
+
+                printf("\tIndex: %u. Name: %s. pcieId: %s\n", (uint32_t)i, prop.name, pcieStr);
             }
         }
         else
@@ -3523,44 +4571,10 @@ int utf8_main(int argc, char *argv[])
         return 0;
     }
 
-    // check for duplicate PCIeBusIds(rare case), only if raw device list is disabled
-    if (!rawDeviceList)
-    {
-        int32_t prevPlatformIndex = -1;
-        int32_t prevPcieId = -1;
-        for (size_t i = 0; i < cldevices.size(); ++i)
-        {
-            if((cldevices[i].pcieBusId == prevPcieId) &&
-               (cldevices[i].platformIndex == prevPlatformIndex))
-            {
-                if (cmdr.generateConfigFile)
-                {
-                    applog(LOG_WARNING, "Failed to group logical devices by PCIe slot ID. Duplicates Found!");
-                }
-                rawDeviceList = true;
-                break;
-            }
-            else
-            {
-                prevPlatformIndex = cldevices[i].platformIndex;
-                prevPcieId = cldevices[i].pcieBusId;
-            }
-        }
-    }
-
+    //-----------------------------------------------------------------------------
     // Config generation
     if (cmdr.generateConfigFile)
     {
-        if (rawDeviceList)
-        {
-            applog(LOG_INFO, "Configuration file device list format: \"raw device list\"");
-            applog(LOG_WARNING, "All possible OpenCL device/platform combinations will be listed.");
-        }
-        else
-        {
-            applog(LOG_INFO, "Configuration file device list format: \"pcie bus id\"");
-        }
-
         // Miner configration
         std::string configText("#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#\n"
                                "# Global settings:\n"
@@ -3667,11 +4681,11 @@ int utf8_main(int argc, char *argv[])
                                "\n");
 
         // OpenCL devices
-        vh::generateCLDeviceConfig(clplatformIds, cldevices, rawDeviceList, configText); 
+        vh::generateCLDeviceConfig(clplatformIds, cldevices, configText); 
 #ifdef HAVE_CUDA
         configText += "\n";
         // CUDA devices
-        vh::generateCUDADeviceConfig(cudeviceListSize, rawDeviceList, configText);
+        vh::generateCUDADeviceConfig(cudevices, configText);
 #endif
         // save a config file.
         if (fileExists(cmdr.generateConfigFileName) == true)
@@ -3707,27 +4721,53 @@ int utf8_main(int argc, char *argv[])
     {
         for (size_t i = 0; i < cmdr.selectedCLDevices.size(); ++i)
         {
-            uint32_t workSize = cmdr.selectedCLDevices[i].workSize;
             // validate parameters
             if (cmdr.selectedCLDevices[i].deviceIndex >= cldevices.size()) 
             {
                 applog(LOG_ERR, "Invalid CL device index: %u", cmdr.selectedCLDevices[i].deviceIndex);
                 cmd_result_free(&cmdr);
                 return 1;
-
             }
-            else if ( (workSize == 0) || ((workSize % 256) != 0))
+
+            uint32_t workSize = cmdr.selectedCLDevices[i].workSize;
+            if ((workSize % 256) != 0)
             {
-                // TODO: rewrite
-                applog(LOG_WARNING, "Invalid CL Device \"WorkSize\" parameter(index: %u, workSize: %u)",
+                applog(LOG_WARNING, "Invalid CL Device \"WorkSize\"(w) parameter(index: %u, workSize: %u)",
                        cmdr.selectedCLDevices[i].deviceIndex, workSize);
-                applog(LOG_WARNING, "Setting CL Device\"WorkSize\" to default: %u", vh::defaultWorkSize);
+                applog(LOG_WARNING, "It must be multiple of 256. Using default: %u", vh::defaultWorkSize);
+
                 workSize = vh::defaultWorkSize;
             }
 
+            uint32_t batchTimeMs = cmdr.selectedCLDevices[i].batchTimeMs;
+            if (batchTimeMs == 0)
+            {
+                applog(LOG_WARNING, "Invalid CL Device \"BatchTime\"(b) parameter(index: %u, batchTime: %u)",
+                       cmdr.selectedCLDevices[i].deviceIndex, batchTimeMs);
+                applog(LOG_WARNING, "It must be above 0. Using default: %u", vh::defaultBatchTimeMs);
+                batchTimeMs = vh::defaultBatchTimeMs;
+            }
+
+            uint32_t occupancyPct = cmdr.selectedCLDevices[i].occupancyPct;
+            if ((occupancyPct == 0) || (occupancyPct > 100))
+            {
+                applog(LOG_WARNING, "Invalid CL Device \"OccupancyPct\"(o) parameter(index: %u, occupancyPct: %u)",
+                       cmdr.selectedCLDevices[i].deviceIndex, occupancyPct);
+                applog(LOG_WARNING, "It must be above 0 and less than or equal to 100. Using default: %u", vh::defaultOccupancyPct);
+
+                occupancyPct = vh::defaultOccupancyPct;
+            }
+
+
             clworker_t clworker;
+            clworker.nvmlDevice = NULL;
+            clworker.adlAdapterIndex = -1;
             clworker.cldevice = cldevices[cmdr.selectedCLDevices[i].deviceIndex];
             clworker.workSize = workSize;
+            clworker.batchTimeMs = batchTimeMs;
+            clworker.occupancyPct = occupancyPct;
+            clworker.deviceMonitor = cmdr.selectedCLDevices[i].deviceMonitor;
+            clworker.gpuTemperatureLimit = cmdr.selectedCLDevices[i].gpuTemperatureLimit;
             // AsmProgram will be detected on context init
             clworker.cldevice.binaryFormat = vh::BF_AUTO; 
             clworker.cldevice.asmProgram = vh::AP_None; 
@@ -3739,8 +4779,14 @@ int utf8_main(int argc, char *argv[])
         for (size_t i = 0; i < cldevices.size(); ++i)
         {
             clworker_t clworker;
+            clworker.nvmlDevice = NULL;
+            clworker.adlAdapterIndex = -1;
             clworker.cldevice = cldevices[i];
             clworker.workSize = vh::defaultWorkSize;
+            clworker.batchTimeMs = vh::defaultBatchTimeMs;
+            clworker.occupancyPct = vh::defaultOccupancyPct;
+            clworker.deviceMonitor = vh::defaultDeviceMonitor;
+            clworker.gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
             // AsmProgram will be detected on context init
             clworker.cldevice.binaryFormat = vh::BF_AUTO; 
             clworker.cldevice.asmProgram = vh::AP_None; 
@@ -3756,37 +4802,67 @@ int utf8_main(int argc, char *argv[])
     {
         for (size_t i = 0; i < cmdr.selectedCUDevices.size(); ++i)
         {
-            uint32_t workSize = cmdr.selectedCUDevices[i].workSize;
             // validate parameters
             if (cmdr.selectedCUDevices[i].deviceIndex >= cudeviceListSize) 
             {
                 applog(LOG_ERR, "Invalid CUDA device index: %u", cmdr.selectedCUDevices[i].deviceIndex);
                 cmd_result_free(&cmdr);
                 return 1;
-
             }
-            else if ( (workSize == 0) || ((workSize % 256) != 0))
+
+            uint32_t workSize = cmdr.selectedCUDevices[i].workSize;
+            if ((workSize % 256) != 0)
             {
-                // TODO: rewrite
-                applog(LOG_WARNING, "Invalid CUDA Device \"WorkSize\" parameter(index: %u, workSize: %u)",
+                applog(LOG_WARNING, "Invalid CUDA Device \"WorkSize\"(w) parameter(index: %u, workSize: %u)",
                        cmdr.selectedCUDevices[i].deviceIndex, workSize);
-                applog(LOG_WARNING, "Setting CUDA Device\"WorkSize\" to default: %u", vh::defaultWorkSize);
+                applog(LOG_WARNING, "It must be multiple of 256. Using default: %u", vh::defaultWorkSize);
+
                 workSize = vh::defaultWorkSize;
             }
 
+            uint32_t batchTimeMs = cmdr.selectedCUDevices[i].batchTimeMs;
+            if (batchTimeMs == 0)
+            {
+                applog(LOG_WARNING, "Invalid CUDA Device \"BatchTime\"(b) parameter(index: %u, batchTime: %u)",
+                       cmdr.selectedCUDevices[i].deviceIndex, batchTimeMs);
+                applog(LOG_WARNING, "It must be above 0. Using default: %u", vh::defaultBatchTimeMs);
+                batchTimeMs = vh::defaultBatchTimeMs;
+            }
+
+            uint32_t occupancyPct = cmdr.selectedCUDevices[i].occupancyPct;
+            if ((occupancyPct == 0) || (occupancyPct > 100))
+            {
+                applog(LOG_WARNING, "Invalid CUDA Device \"OccupancyPct\"(o) parameter(index: %u, occupancyPct: %u)",
+                       cmdr.selectedCUDevices[i].deviceIndex, occupancyPct);
+                applog(LOG_WARNING, "It must be above 0 and less than or equal to 100. Using default: %u", vh::defaultOccupancyPct);
+
+                occupancyPct = vh::defaultOccupancyPct;
+            }
+
+
             cuworker_t cuworker;
-            cuworker.cudevice = cmdr.selectedCUDevices[i].deviceIndex;
+            cuworker.nvmlDevice = NULL;
+            cuworker.cudevice = cudevices[cmdr.selectedCUDevices[i].deviceIndex];
             cuworker.workSize = workSize;
+            cuworker.batchTimeMs = batchTimeMs;
+            cuworker.occupancyPct = occupancyPct;
+            cuworker.deviceMonitor = cmdr.selectedCUDevices[i].deviceMonitor;
+            cuworker.gpuTemperatureLimit = cmdr.selectedCUDevices[i].gpuTemperatureLimit;
             cuworkers.push_back(cuworker);
         }
     }
     else // add all CUDA devices
     {
-        for (int i = 0; i < cudeviceListSize; ++i)
+        for (size_t i = 0; i < cudevices.size(); ++i)
         {
             cuworker_t cuworker;
-            cuworker.cudevice = i;
+            cuworker.nvmlDevice = NULL;
+            cuworker.cudevice = cudevices[i];
             cuworker.workSize = vh::defaultWorkSize;
+            cuworker.batchTimeMs = vh::defaultBatchTimeMs;
+            cuworker.occupancyPct = vh::defaultOccupancyPct;
+            cuworker.deviceMonitor = vh::defaultDeviceMonitor;
+            cuworker.gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
             cuworkers.push_back(cuworker);
         }
     }
@@ -4257,6 +5333,330 @@ int utf8_main(int argc, char *argv[])
         }
 
 
+        // Check if no devices are selected are using command line paramaters
+        if ((!cmdr.selectAllCLDevices) && (!cmdr.selectedCLDevices.size()))
+        {
+            // Configure OpenCL devices from the configuration file.
+            size_t deviceBlockIndex = 0;
+            std::string dCLBlockName("CL_Device");
+            std::string binaryFormatName;
+            std::string asmProgramName;
+            std::string batchSizeStr;
+            std::string deviceBlock = dCLBlockName + std::to_string(deviceBlockIndex);
+            
+            while( (csetting = cf.getSetting(deviceBlock.c_str(), "DeviceIndex")) )
+            {
+                size_t deviceIndex = (size_t)csetting->AsInt;
+                if (deviceIndex >= cldevices.size())
+                {
+                    applog(LOG_WARNING, "\"DeviceIndex\" is invalid inside \"%s\" section. Skipping device...", deviceBlock.c_str());
+                    ++cfWarnings;
+
+                    // move to the next device
+                    ++deviceBlockIndex;
+                    deviceBlock = dCLBlockName + std::to_string(deviceBlockIndex);
+
+                    continue;
+                }
+
+#ifdef HAVE_CUDA
+                // Handle Nvidia GPU to CUDA restrictions
+                if (cmdr.restrictNVGPUToCUDA)
+                {
+                    if (cldevices[deviceIndex].vendor == vh::V_NVIDIA)
+                    {
+                        cl_int nvCCMajor = -1;
+                        cl_int status0 = clGetDeviceInfo(cldevices[deviceIndex].clId, CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(cl_int), &nvCCMajor, NULL);
+                        cl_int nvCCMinor = -1;
+                        cl_int status1 = clGetDeviceInfo(cldevices[deviceIndex].clId, CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(cl_int), &nvCCMinor, NULL);
+                        if((status0 == CL_SUCCESS) && (status1 == CL_SUCCESS))
+                        {
+                            // CUDA 11 or higher
+                            if (CUDART_VERSION >= 11000)
+                            {
+                                // CUDA 11 removed SM 3.0 support.
+                                // Transfer SM 3.0 to the OpenCL backend
+                                if (!((nvCCMajor == 3) && (nvCCMinor == 0)))
+                                {
+                                    applog(LOG_ERR, "It looks like this configuration file has been generated with --no-restrict-cuda parameter!");
+                                    applog(LOG_ERR, "Please restart application with '--no-restrict-cuda'. Exiting.");
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
+                }
+#endif
+
+                // setting to default values
+                uint32_t workSize = vh::defaultWorkSize;
+                uint32_t batchTimeMs = vh::defaultBatchTimeMs;
+                uint32_t occupancyPct = vh::defaultOccupancyPct;
+                int deviceMonitor = vh::defaultDeviceMonitor;
+                int gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
+                vh::EBinaryFormat binaryFormat = vh::BF_None;
+                vh::EAsmProgram asmProgram = vh::AP_None; 
+
+                // TODO: We don't validate these 2 parameters because they are not used for now
+                // get program binary format
+                csetting = cf.getSetting(deviceBlock.c_str(), "BinaryFormat"); 
+                if (csetting)
+                {
+                    binaryFormatName = csetting->AsString;
+                    binaryFormat = vh::getBinaryFormatFromName(binaryFormatName);
+                }
+
+                // get asm program name
+                csetting = cf.getSetting(deviceBlock.c_str(), "AsmProgram"); 
+                if (csetting)
+                {
+                    asmProgramName = csetting->AsString;
+                    asmProgram = vh::getAsmProgramName(asmProgramName);
+                }
+
+                // get work size parameter and validate it
+                csetting = cf.getSetting(deviceBlock.c_str(), "WorkSize"); 
+                if (csetting)
+                {
+                    workSize = (uint32_t)csetting->AsInt;
+                    if ((workSize % 256) != 0)
+                    {
+                        applog(LOG_WARNING, "\"WorkSize\" parameter is incorrect inside \"%s\" section."
+                                            " It must be multiple of 256. Using default: %u.",
+                               deviceBlock.c_str(), vh::defaultWorkSize);
+                        ++cfWarnings;
+                    }
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"WorkSize\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultWorkSize);
+                    ++cfWarnings;
+                }
+
+                // get batch time and validate it
+                csetting = cf.getSetting(deviceBlock.c_str(), "BatchTimeMs"); 
+                if (csetting)
+                {
+                    batchTimeMs = (uint32_t)csetting->AsInt;
+                    if (batchTimeMs == 0)
+                    {
+                        applog(LOG_WARNING, "\"BatchTime\" parameter is incorrect inside \"%s\" section."
+                                            " It must be above 0. Using default: %u",
+                               deviceBlock.c_str(), vh::defaultBatchTimeMs);
+                        ++cfWarnings;
+                    }
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"BatchTime\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultBatchTimeMs);
+                    ++cfWarnings;
+                }
+
+                // get occupancy percent and validate it
+                csetting = cf.getSetting(deviceBlock.c_str(), "OccupancyPct"); 
+                if (csetting)
+                {
+                    occupancyPct = (uint32_t)csetting->AsInt;
+                    if ((occupancyPct == 0) || (occupancyPct > 100))
+                    {
+                        applog(LOG_WARNING, "\"OccupancyPct\" parameter is incorrect inside \"%s\" section."
+                                            " It must be above 0 and less than or equal to 100. Using default: %u",
+                               deviceBlock.c_str(), vh::defaultOccupancyPct);
+                        ++cfWarnings;
+                    }
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"OccupancyPct\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultOccupancyPct);
+                    ++cfWarnings;
+                }
+
+                // get device monitoring level
+                csetting = cf.getSetting(deviceBlock.c_str(), "DeviceMonitor"); 
+                if (csetting)
+                {
+                    deviceMonitor = csetting->AsInt;
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"DeviceMonitor\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultDeviceMonitor);
+                    ++cfWarnings;
+                }
+
+                // get GPU temperature limit level
+                csetting = cf.getSetting(deviceBlock.c_str(), "GPUTemperatureLimit"); 
+                if (csetting)
+                {
+                    gpuTemperatureLimit = csetting->AsInt;
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"GPUTemperatureLimit\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultGPUTemperatureLimit);
+                    ++cfWarnings;
+                }
+
+                // check if device index is correct
+                clworker_t clworker;
+                clworker.nvmlDevice = NULL;
+                clworker.adlAdapterIndex = -1;
+                clworker.cldevice = cldevices[deviceIndex];
+                clworker.workSize = workSize;
+                clworker.batchTimeMs = batchTimeMs;
+                clworker.occupancyPct = occupancyPct;
+                clworker.gpuTemperatureLimit = gpuTemperatureLimit;
+                clworker.deviceMonitor = deviceMonitor;
+                // AsmProgram will be detected on context init
+                clworker.cldevice.binaryFormat = binaryFormat;
+                clworker.cldevice.asmProgram = asmProgram;
+                clworkers.push_back(clworker);
+
+                ++deviceBlockIndex;
+                deviceBlock = dCLBlockName + std::to_string(deviceBlockIndex);
+            }
+        } // end ((!cmdr.selectAllDevices) && (!cmdr.selectedCLDevices.size()))
+
+
+#ifdef HAVE_CUDA
+        // Check if no devices are selected are using command line paramaters
+        if ((!cmdr.selectAllCUDevices) && (!cmdr.selectedCUDevices.size()))
+        {
+            // Configure CUDA devices from the configuration file.
+            size_t deviceBlockIndex = 0;
+            std::string dCUBlockName("CU_Device");
+            std::string deviceBlock = dCUBlockName + std::to_string(deviceBlockIndex);
+            std::string batchSizeStr;
+
+            while( (csetting = cf.getSetting(deviceBlock.c_str(), "DeviceIndex")) )
+            {
+                int deviceIndex = csetting->AsInt;
+                if ((deviceIndex >= cudeviceListSize) || (deviceIndex < 0))
+                {
+                    applog(LOG_WARNING, "\"DeviceIndex\" is invalid inside \"%s\" section. Skipping device...", deviceBlock.c_str());
+                    ++cfWarnings;
+
+                    // move to the next device
+                    ++deviceBlockIndex;
+                    deviceBlock = dCUBlockName + std::to_string(deviceBlockIndex);
+
+                    continue;
+                }
+
+                // set to default values
+                uint32_t workSize = vh::defaultWorkSize;
+                uint32_t batchTimeMs = vh::defaultBatchTimeMs;
+                uint32_t occupancyPct = vh::defaultOccupancyPct;
+                int deviceMonitor = vh::defaultDeviceMonitor;
+                int gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
+
+                // get work size parameter and validate it
+                csetting = cf.getSetting(deviceBlock.c_str(), "WorkSize"); 
+                if (csetting)
+                {
+                    workSize = (uint32_t)csetting->AsInt;
+                    if ((workSize % 256) != 0)
+                    {
+                        applog(LOG_WARNING, "\"WorkSize\" parameter is incorrect inside \"%s\" section."
+                                            " It must be multiple of 256. Using default: %u.",
+                               deviceBlock.c_str(), vh::defaultWorkSize);
+                        ++cfWarnings;
+                    }
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"WorkSize\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultWorkSize);
+                    ++cfWarnings;
+                }
+
+                // get batch time and validate it
+                csetting = cf.getSetting(deviceBlock.c_str(), "BatchTimeMs"); 
+                if (csetting)
+                {
+                    batchTimeMs = (uint32_t)csetting->AsInt;
+                    if (batchTimeMs == 0)
+                    {
+                        applog(LOG_WARNING, "\"BatchTime\" parameter is incorrect inside \"%s\" section."
+                                            " It must be above 0. Using default: %u",
+                               deviceBlock.c_str(), vh::defaultBatchTimeMs);
+                        ++cfWarnings;
+                    }
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"BatchTime\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultBatchTimeMs);
+                    ++cfWarnings;
+                }
+
+                // get occupancy percent and validate it
+                csetting = cf.getSetting(deviceBlock.c_str(), "OccupancyPct"); 
+                if (csetting)
+                {
+                    occupancyPct = (uint32_t)csetting->AsInt;
+                    if ((occupancyPct == 0) || (occupancyPct > 100))
+                    {
+                        applog(LOG_WARNING, "\"OccupancyPct\" parameter is incorrect inside \"%s\" section."
+                                            " It must be above 0 and less than or equal to 100. Using default: %u",
+                               deviceBlock.c_str(), vh::defaultOccupancyPct);
+                        ++cfWarnings;
+                    }
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"OccupancyPct\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultOccupancyPct);
+                    ++cfWarnings;
+                }
+
+                // get device monitoring level
+                csetting = cf.getSetting(deviceBlock.c_str(), "DeviceMonitor"); 
+                if (csetting)
+                {
+                    deviceMonitor = csetting->AsInt;
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"DeviceMonitor\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultDeviceMonitor);
+                    ++cfWarnings;
+                }
+
+                // get GPU temperature limit level
+                csetting = cf.getSetting(deviceBlock.c_str(), "GPUTemperatureLimit"); 
+                if (csetting)
+                {
+                    gpuTemperatureLimit = csetting->AsInt;
+                }
+                else
+                {
+                    applog(LOG_WARNING, "Failed to get a \"GPUTemperatureLimit\" option inside \"%s\" section. Setting to: \"%u\".",
+                           deviceBlock.c_str(), vh::defaultGPUTemperatureLimit);
+                    ++cfWarnings;
+                }
+
+                // create CUDA worker
+                cuworker_t cuworker;
+                cuworker.nvmlDevice = NULL;
+                cuworker.cudevice = cudevices[deviceIndex];
+                cuworker.workSize = workSize;
+                cuworker.batchTimeMs = batchTimeMs;
+                cuworker.occupancyPct = occupancyPct;
+                cuworker.gpuTemperatureLimit = gpuTemperatureLimit;
+                cuworker.deviceMonitor = deviceMonitor;
+                cuworkers.push_back(cuworker);
+
+                // move to the next device
+                ++deviceBlockIndex;
+                deviceBlock = dCUBlockName + std::to_string(deviceBlockIndex);
+            }
+        }
+#endif
+
         // Final configuration validation.
         if (cfErrors > 0)
         {
@@ -4269,262 +5669,6 @@ int utf8_main(int argc, char *argv[])
             applog(LOG_INFO, "Miner has been successfully configured! (Errors: %d, Warnings: %d)", cfErrors, cfWarnings);
         }
 
-
-        if ((!cmdr.selectAllCLDevices) && (!cmdr.selectedCLDevices.size()))
-        {
-            //-----------------------------------------------------------------------------
-            // OpenCL device section.
-
-
-            // TODO: AsmProgram and BinaryFormat automatic detection
-
-            //-------------------------------------
-            // setup devices
-            size_t deviceBlockIndex = 0;
-            std::string dCLBlockName("CL_Device");
-            std::string binaryFormatName;
-            std::string asmProgramName;
-            std::string deviceBlock = dCLBlockName + std::to_string(deviceBlockIndex);
-            
-            // check if configuration file is in "raw device list" format
-            csetting = cf.getSetting(deviceBlock.c_str(), "PCIeBusId");
-            if (!csetting)
-                rawDeviceList = true;
-
-            // PCIeBusId is the only required setting, others are optional
-            if (!rawDeviceList)
-            {
-                while ( (csetting = cf.getSetting(deviceBlock.c_str(), "PCIeBusId")) )
-                {
-                    int pcieBusId = csetting->AsInt;
-                    int platformIndex = -1;
-                    int workSize = 0;
-                    vh::EBinaryFormat binaryFormat = vh::BF_None;
-                    vh::EAsmProgram asmProgram = vh::AP_None; 
-
-                    // get platform index
-                    csetting = cf.getSetting(deviceBlock.c_str(), "PlatformIndex"); 
-                    if (csetting) platformIndex = csetting->AsInt;
-
-                    // get program binary format
-                    csetting = cf.getSetting(deviceBlock.c_str(), "BinaryFormat"); 
-                    if (csetting)
-                    {
-                        binaryFormatName = csetting->AsString;
-                        binaryFormat = vh::getBinaryFormatFromName(binaryFormatName);
-                    }
-
-                    // get asm program name
-                    csetting = cf.getSetting(deviceBlock.c_str(), "AsmProgram"); 
-                    if (csetting)
-                    {
-                        asmProgramName = csetting->AsString;
-                        asmProgram = vh::getAsmProgramName(asmProgramName);
-                    }
-
-                    // get work size flag
-                    csetting = cf.getSetting(deviceBlock.c_str(), "WorkSize"); 
-                    if (csetting) workSize = csetting->AsInt;
-
-                    // check if pcieID and platfromIndex are correct
-                    ptrdiff_t foundByPCIeBusId = -1;
-                    ptrdiff_t foundByPlatformIndex = -1;
-                    for (size_t i = 0; i < cldevices.size(); ++i)
-                    {
-                        vh::cldevice_t& dv = cldevices[i];
-                        if (dv.pcieBusId == pcieBusId) 
-                        {
-                            foundByPCIeBusId = i;
-                            if (dv.platformIndex == platformIndex) 
-                            {
-                                foundByPlatformIndex = i;
-                                break;
-                            }
-                        }
-                        // check all logical devices in case they were sorted wrong...
-                    }
-
-                    // add a configured device if it was found
-                    if (foundByPCIeBusId >= 0)
-                    {
-                        clworker_t clworker;
-                        if (foundByPlatformIndex >= 0)
-                            clworker.cldevice = cldevices[foundByPlatformIndex];
-                        else
-                        {
-                            // unlike pcieBusId, platform index may not be static.
-                            applog(LOG_WARNING, "\"PlatformIndex\" parameter is not set or incorrect"
-                                                "ver inside \"%s\" section. Using default(%d).",
-                                   deviceBlock.c_str(), cldevices[foundByPCIeBusId].platformIndex);
-
-                            clworker.cldevice = cldevices[foundByPCIeBusId];
-                        }
-
-                        // check if workSize is set correct.
-                        // TODO: review for other vendors/drivers
-                        if ( (workSize > 0) && ((workSize % 256) == 0) )
-                            clworker.workSize = workSize;
-                        else
-                        {
-                            applog(LOG_WARNING, "\"WorkSize\" parameter is not set or incorrect inside \"%s\" section."
-                                                "It must be multiple of 256. Using default(%u).",
-                                   deviceBlock.c_str(), vh::defaultWorkSize);
-
-                            clworker.workSize = vh::defaultWorkSize;
-                        }
-
-                        // AsmProgram will be detected on context init
-                        clworker.cldevice.binaryFormat = binaryFormat;
-                        clworker.cldevice.asmProgram = asmProgram;
-
-                        clworkers.push_back(clworker);
-                    }
-                    else
-                    {
-                        if ((platformIndex >= 0) && (platformIndex < clplatformIds.size()))
-                        {
-                            // check (maybe config file was generated with --no-restrict-cuda)
-                            size_t pVendorStringSize = 0;
-                            clGetPlatformInfo(clplatformIds[platformIndex], CL_PLATFORM_VENDOR, 0, nullptr, &pVendorStringSize);
-                            std::string pVendorString(pVendorStringSize, ' ');
-                            clGetPlatformInfo(clplatformIds[platformIndex], CL_PLATFORM_VENDOR, pVendorStringSize, (void*)pVendorString.data(), nullptr);
-
-                            if (pVendorString.find(platformVendorNV) != std::string::npos) 
-                            {
-                                if (!cmdr.restrictNVGPUToCUDA)
-                                {
-                                    applog(LOG_WARNING, "It looks like %s was configured with --no-restrict-cuda parameter. Skipping device...", deviceBlock.c_str());
-                                    applog(LOG_WARNING, "Please restart application with '--no-restrict-cuda'");
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // It seems config file is just wrong.
-                            applog(LOG_WARNING, "\"PCIeBusId\" is invalid inside \"%s\" section. Skipping device...",
-                                   deviceBlock.c_str());
-                        }
-                    }
-
-                    ++deviceBlockIndex;
-                    deviceBlock = dCLBlockName + std::to_string(deviceBlockIndex);
-                }
-            }
-            else
-            {
-                while( (csetting = cf.getSetting(deviceBlock.c_str(), "DeviceIndex")) )
-                {
-                    size_t deviceIndex = (size_t)csetting->AsInt;
-                    int workSize = 0;
-                    vh::EBinaryFormat binaryFormat = vh::BF_None;
-                    vh::EAsmProgram asmProgram = vh::AP_None; 
-
-                    // get program binary format
-                    csetting = cf.getSetting(deviceBlock.c_str(), "BinaryFormat"); 
-                    if (csetting)
-                    {
-                        binaryFormatName = csetting->AsString;
-                        binaryFormat = vh::getBinaryFormatFromName(binaryFormatName);
-                    }
-
-                    // get asm program name
-                    csetting = cf.getSetting(deviceBlock.c_str(), "AsmProgram"); 
-                    if (csetting)
-                    {
-                        asmProgramName = csetting->AsString;
-                        asmProgram = vh::getAsmProgramName(asmProgramName);
-                    }
-
-                    // get work size flag
-                    csetting = cf.getSetting(deviceBlock.c_str(), "WorkSize"); 
-                    if (csetting) workSize = csetting->AsInt;
-
-                    // check if pcieBusId and platfromIndex are correct
-                    if ((deviceIndex < cldevices.size()) && (deviceIndex >= 0))
-                    {
-                        clworker_t clworker;
-                        clworker.cldevice = cldevices[deviceIndex];
-
-                        // check if workSize is set correct.
-                        // TODO: review for other vendors/drivers
-                        if ( (workSize > 0) && ((workSize % 256) == 0) )
-                            clworker.workSize = workSize;
-                        else
-                        {
-                            applog(LOG_WARNING, "\"WorkSize\" parameter is not set or incorrect inside \"%s\" section."
-                                                " It must be multiple of 256. Using default(%u).",
-                                   deviceBlock.c_str(), vh::defaultWorkSize);
-
-                            clworker.workSize = vh::defaultWorkSize;
-                        }
-
-                        // AsmProgram will be detected on context init
-                        clworker.cldevice.binaryFormat = binaryFormat;
-                        clworker.cldevice.asmProgram = asmProgram;
-                        clworkers.push_back(clworker);
-                    }
-                    else
-                    {
-                        applog(LOG_WARNING, "\"DeviceIndex\" is invalid inside \"%s\" section. Skipping device...", deviceBlock.c_str());
-                    }
-
-                    ++deviceBlockIndex;
-                    deviceBlock = dCLBlockName + std::to_string(deviceBlockIndex);
-                }
-            } // end !rawDeviceList
-        } // end ((!cmdr.selectAllDevices) && (!cmdr.selectedCLDevices.size()))
-
-
-#ifdef HAVE_CUDA
-        if ((!cmdr.selectAllCUDevices) && (!cmdr.selectedCUDevices.size()))
-        {
-            //-----------------------------------------------------------------------------
-            // CUDA device section.
-            size_t deviceBlockIndex = 0;
-            std::string dCUBlockName("CU_Device");
-            std::string deviceBlock = dCUBlockName + std::to_string(deviceBlockIndex);
-
-            while( (csetting = cf.getSetting(deviceBlock.c_str(), "DeviceIndex")) )
-            {
-                int deviceIndex = (size_t)csetting->AsInt;
-                int workSize = 0;
-
-                // get work size flag
-                csetting = cf.getSetting(deviceBlock.c_str(), "WorkSize"); 
-                if (csetting) workSize = csetting->AsInt;
-
-                // check if pcieBusId and platfromIndex are correct
-                if ((deviceIndex < cudeviceListSize) && (deviceIndex >= 0))
-                {
-                    cuworker_t cuworker;
-                    cuworker.cudevice = deviceIndex;
-
-                    // check if workSize is set correct.
-                    // TODO: review for other vendors/drivers
-                    if ( (workSize > 0) && ((workSize % 256) == 0) )
-                        cuworker.workSize = workSize;
-                    else
-                    {
-                        applog(LOG_WARNING, "\"WorkSize\" parameter is not set or incorrect inside \"%s\" section."
-                                            " It must be multiple of 256. Using default(%u).",
-                               deviceBlock.c_str(), vh::defaultWorkSize);
-
-                        cuworker.workSize = vh::defaultWorkSize;
-                    }
-
-                    // AsmProgram will be detected on context init
-                    cuworkers.push_back(cuworker);
-                }
-                else
-                {
-                    applog(LOG_WARNING, "\"DeviceIndex\" is invalid inside \"%s\" section. Skipping device...", deviceBlock.c_str());
-                }
-
-                ++deviceBlockIndex;
-                deviceBlock = dCUBlockName + std::to_string(deviceBlockIndex);
-            }
-        }
-#endif
     } // end usingConfigFile
     else
     {
@@ -4643,6 +5787,210 @@ int utf8_main(int argc, char *argv[])
         return 1;
     }
 #endif
+
+    //-----------------------------------------------------------------------------
+    // GPU Monitoring
+
+    //-------------------------------------
+    // NVML backend
+    int libNVMLRC = nvmlInitApi();
+    if (libNVMLRC == 0)
+    {
+        // First initialize NVML library
+        nvmlReturn_t nvmlRC = nvmlInitWithFlags(0);
+        if (nvmlRC != NVML_SUCCESS)
+        { 
+            applog(LOG_WARNING, "Failed to initialize NVML: %s", nvmlErrorString(nvmlRC));
+            // goto exit TODO:
+        }
+
+        unsigned int nvml_device_count = 0;
+        nvmlRC = nvmlDeviceGetCount(&nvml_device_count);
+        if (nvmlRC != NVML_SUCCESS)
+        { 
+            applog(LOG_WARNING, "Failed to query device count: %s", nvmlErrorString(nvmlRC));
+            // goto exit TODO:
+        }
+        applog(LOG_DEBUG, "Found %u NVML device%s", nvml_device_count, nvml_device_count != 1 ? "s" : "");
+
+
+        nvmlDevice_t nvmlDevices[64] = {};
+        for (unsigned int i = 0; i < nvml_device_count; i++)
+        {
+            nvmlRC = nvmlDeviceGetHandleByIndex(i, &nvmlDevices[(size_t)i]);
+            if (nvmlRC != NVML_SUCCESS)
+            {
+                applog(LOG_WARNING, "Failed to get handle for device %u: %s", i, nvmlErrorString(nvmlRC));
+            }
+        }
+
+        // configure all NVML cappable OpenCL workers
+        for (size_t i = 0; i < clworkers.size(); ++i)
+        {
+            // Skip non NVIDIA devices
+            if (clworkers[i].cldevice.vendor != vh::V_NVIDIA)
+            {
+                continue;
+            }
+
+            for (size_t n = 0; n < (size_t)nvml_device_count; ++n)
+            {
+                nvmlPciInfo_t pci;
+                nvmlDeviceGetPciInfo(nvmlDevices[n], &pci);
+
+                if (clworkers[i].cldevice.pcieBusId == pci.bus &&
+                    clworkers[i].cldevice.pcieDeviceId == pci.device &&
+                    clworkers[i].cldevice.pcieFunctionId == pci.domain)
+                {
+                    clworkers[i].nvmlDevice = nvmlDevices[n];
+                    break;
+                }
+            }
+        }
+
+#ifdef HAVE_CUDA
+        // configure all NVML cappable CUDA workers
+        for (size_t i = 0; i < cuworkers.size(); ++i)
+        {
+            for (size_t n = 0; n < (size_t)nvml_device_count; ++n)
+            {
+                nvmlPciInfo_t pci;
+                nvmlDeviceGetPciInfo(nvmlDevices[n], &pci);
+
+                if (cuworkers[i].cudevice.pcieBusId == pci.bus &&
+                    cuworkers[i].cudevice.pcieDeviceId == pci.device &&
+                    cuworkers[i].cudevice.pcieFunctionId == pci.domain)
+                {
+                    cuworkers[i].nvmlDevice = nvmlDevices[n];
+                    break;
+                }
+            }
+        }
+#endif
+    }
+    else
+    {
+        // TODO: handle error codes
+        applog(LOG_WARNING, "Failed to initalize NVML API");
+        // goto exit TODO:
+    }
+
+    // TODO: implement NVML library unload
+
+
+    //-------------------------------------
+    // ADL backend
+    int libADLRC = adlInitApi();
+    if (libADLRC == 0)
+    {
+        ADL_CONTEXT_HANDLE adlContext = NULL;
+        int adlRC = ADL2_Main_Control_Create(ADL_Main_Memory_Alloc, 1, &adlContext);
+        if (adlRC == ADL_OK)
+        {
+            int numAdapters = 0;
+            adlRC = ADL2_Adapter_NumberOfAdapters_Get(adlContext, &numAdapters);
+            if (adlRC != ADL_OK)
+            {
+                applog(LOG_WARNING, "Failed to get the number of adapters");
+                // goto exit TODO:
+            }
+
+            if (numAdapters > 0)
+            {
+                AdapterInfo *adapterInfos = (AdapterInfo *)malloc(sizeof(AdapterInfo) * numAdapters);
+                if (!adapterInfos)
+                {
+                    applog(LOG_ERR, "Failed to allocate memory for adapterInfos");
+                    adlRC = ADL2_Main_Control_Destroy(adlContext);
+                    if (adlRC != ADL_OK)
+                    {
+                        applog(LOG_ERR, "Failed to destroy ADL context");
+                    }
+                    return 1;
+                }
+
+                // get ADL adapter infos
+                ADL2_Adapter_AdapterInfo_Get(adlContext, adapterInfos, sizeof(AdapterInfo)* numAdapters);
+
+                // get unique and suitable adapter indices
+                std::vector<size_t> adapterInfoIndices;
+                int lastAdapterId = -1;
+                for (size_t i = 0; i < (size_t)numAdapters; ++i)
+                {
+                    int adapterId;
+                    adlRC = ADL2_Adapter_ID_Get(adlContext, adapterInfos[i].iAdapterIndex, &adapterId);
+                    if (adlRC != ADL_OK)
+                    {
+                        if ((adapterInfos[i].iVendorID == 1002) && (errorCode == ADL_ERR_DISABLED_ADAPTER))
+                        {
+                            applog(LOG_WARNING, "Found an AMD adapter, but it is disabled(infoIdx:%u)", (uint32_t)i);
+                        }
+                        continue;
+                    }
+
+                    // Filter out non AMD adapters(in case they didn't trigger ADL2_Adapter_ID_Get errors)
+                    if (adapterInfos[i].iVendorID != 1002)
+                    {
+                        continue;
+                    }
+
+                    // Each adapter may have multiple entries
+                    if (adapterId == lastAdapterId)
+                    {
+                        continue;
+                    }
+
+                    adapterInfoIndices.push_back(i);
+
+                    lastAdapterId = adapterId;
+                }
+
+
+                // configure all ADL cappable OpenCL workers
+                for (size_t i = 0; i < clworkers.size(); ++i)
+                {
+                    // Skip non AMD devices
+                    if (clworkers[i].cldevice.vendor != vh::V_AMD)
+                    {
+                        continue;
+                    }
+
+                    for (size_t n = 0; n < adapterInfoIndices.size(); ++n)
+                    {
+                        const size_t ainfIndex = adapterInfoIndices[n];
+
+                        if (clworkers[i].cldevice.pcieBusId == adapterInfos[ainfIndex].iBusNumber &&
+                            clworkers[i].cldevice.pcieDeviceId == adapterInfos[ainfIndex].iDeviceNumber &&
+                            clworkers[i].cldevice.pcieFunctionId == adapterInfos[ainfIndex].iFunctionNumber)
+                        {
+                            clworkers[i].adlAdapterIndex = adapterInfos[ainfIndex].iAdapterIndex;
+                            break;
+                        }
+                    }
+                }
+
+                //-------------------------------------
+                // Free memory
+                ADL_Main_Memory_Free((void**)&adapterInfos);
+
+            } // numAdapters > 0
+
+            adlRC = ADL2_Main_Control_Destroy(adlContext);
+            if (adlRC != ADL_OK)
+            {
+                applog(LOG_ERR, "Failed to destroy ADL context");
+            }
+        }
+        else
+        {
+            applog(LOG_WARNING, "Failed to create ADL context");
+        }
+    }
+    else
+    {
+        applog(LOG_WARNING, "Failed to load ADL functions");
+    }
+
 
     //-------------------------------------
     // Init cURL

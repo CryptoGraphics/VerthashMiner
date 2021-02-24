@@ -248,6 +248,9 @@ CUDA_ADD_EXECUTABLE(VerthashMiner
     src/vhCore/ConfigFile.cpp
     src/vhCore/Util.cpp
     src/vhCore/Verthash.cpp
+    src/vhDevice/ADLUtils.cpp
+    src/vhDevice/NVMLUtils.cpp
+    src/vhDevice/SYSFSUtils.cpp
     src/main.cpp
 )
 else()
@@ -257,6 +260,9 @@ add_executable(VerthashMiner
     src/vhCore/ConfigFile.cpp
     src/vhCore/Util.cpp
     src/vhCore/Verthash.cpp
+    src/vhDevice/ADLUtils.cpp
+    src/vhDevice/NVMLUtils.cpp
+    src/vhDevice/SYSFSUtils.cpp
     src/main.cpp
 )
 endif()
