@@ -18,6 +18,7 @@
 // Verthash constants used to compute bitmask, used inside kernel during IO pass
 #define VH_HASH_OUT_SIZE 32
 #define VH_BYTE_ALIGNMENT 16
+#define VH_HEADER_SIZE 80
 
 //-----------------------------------------------------------------------------
 // Verthash data
@@ -40,9 +41,13 @@ int verthash_info_init(verthash_info_t* info, const char* file_name);
 //! Reset all fields and free allocated data.
 void verthash_info_free(verthash_info_t* info);
 
-
 //! Generate verthash data file and save it to specified location.
 int verthash_generate_data_file(const char* output_file_name);
+
+void verthash_hash(const unsigned char* blob_bytes,
+                   const size_t blob_size,
+                   const unsigned char(*input)[VH_HEADER_SIZE],
+                   unsigned char(*output)[VH_HASH_OUT_SIZE]);
 
 #endif // !Verthash_INCLUDE_ONCE
 

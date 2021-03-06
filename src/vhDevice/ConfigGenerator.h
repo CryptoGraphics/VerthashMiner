@@ -233,8 +233,8 @@ static void generateCUDADeviceConfig(const std::vector<cudevice_t>& cudevices,
         else
         {
             char pcieStr[9] = { };
-            snprintf (pcieStr, 8, "%02x:%02x:%01x",
-                      cudevice.pcieBusId, cudevice.pcieDeviceId, cudevice.pcieFunctionId);
+            snprintf (pcieStr, 8, "%02x:%02x:0",
+                      cudevice.pcieBusId, cudevice.pcieDeviceId);
             deviceListText += std::string(pcieStr);
         }
 

@@ -90,7 +90,7 @@ namespace vh
         // PCIe stuff
         int32_t pcieBusId;
         int32_t pcieDeviceId;
-        int32_t pcieFunctionId;
+        int32_t pcieFunctionId; // 0 for NVIDIA devices
 
         // ASM program handling
         EAsmProgram asmProgram;
@@ -108,7 +108,6 @@ namespace vh
         // PCIe stuff
         int32_t pcieBusId;
         int32_t pcieDeviceId;
-        int32_t pcieFunctionId;
     };
 #endif
     //-----------------------------------------------------------------------------

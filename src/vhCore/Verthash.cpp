@@ -28,6 +28,12 @@ int verthash_info_init(verthash_info_t* info, const char* file_name)
     if (fileNameLen == 0) { return 1; }
 
     info->fileName = (char*)malloc(fileNameLen+1);
+    if (!info->fileName)
+    {
+        // Memory allocation fatal error.
+        return 2;
+    }
+
     memset(info->fileName, 0, fileNameLen+1);
     memcpy(info->fileName, file_name, fileNameLen);
 
@@ -70,6 +76,71 @@ void verthash_info_free(verthash_info_t* info)
     info->bitmask = 0;
 }
 
+
+//-----------------------------------------------------------------------------
+// Verthash hash
+#define VH_P0_SIZE 64
+#define VH_N_ITER 8 
+#define VH_N_SUBSET VH_P0_SIZE*VH_N_ITER
+#define VH_N_ROT 32
+#define VH_N_INDEXES 4096
+#define VH_BYTE_ALIGNMENT 16
+
+static inline uint32_t fnv1a(const uint32_t a, const uint32_t b)
+{
+    return (a ^ b) * 0x1000193;
+}
+
+void verthash_hash(const unsigned char* blob_bytes,
+                   const size_t blob_size,
+                   const unsigned char(*input)[VH_HEADER_SIZE],
+                   unsigned char(*output)[VH_HASH_OUT_SIZE])
+{
+    unsigned char p1[VH_HASH_OUT_SIZE];
+    sha3(&input[0], VH_HEADER_SIZE, &p1[0], VH_HASH_OUT_SIZE);
+
+    unsigned char p0[VH_N_SUBSET];
+
+    unsigned char input_header[VH_HEADER_SIZE];
+    memcpy(input_header, input, VH_HEADER_SIZE);
+
+    for (size_t i = 0; i < VH_N_ITER; ++i)
+    {
+        input_header[0] += 1;
+        sha3(&input_header[0], VH_HEADER_SIZE, p0 + i * VH_P0_SIZE, VH_P0_SIZE);
+    }
+
+    uint32_t* p0_index = (uint32_t*)p0;
+    uint32_t seek_indexes[VH_N_INDEXES];
+
+    for (size_t x = 0; x < VH_N_ROT; ++x)
+    {
+        memcpy(seek_indexes + x * (VH_N_SUBSET / sizeof(uint32_t)), p0, VH_N_SUBSET);
+        for (size_t y = 0; y < VH_N_SUBSET / sizeof(uint32_t); ++y)
+        {
+            *(p0_index + y) = (*(p0_index + y) << 1) | (1 & (*(p0_index + y) >> 31));
+        }
+    }
+
+    uint32_t* p1_32 = (uint32_t*)p1;
+    uint32_t* blob_bytes_32 = (uint32_t*)blob_bytes;
+    uint32_t value_accumulator = 0x811c9dc5;
+    const uint32_t mdiv = ((blob_size - VH_HASH_OUT_SIZE) / VH_BYTE_ALIGNMENT) + 1;
+    for (size_t i = 0; i < VH_N_INDEXES; i++)
+    {
+        const uint32_t offset = (fnv1a(seek_indexes[i], value_accumulator) % mdiv) * VH_BYTE_ALIGNMENT / sizeof(uint32_t);
+        for (size_t i2 = 0; i2 < VH_HASH_OUT_SIZE / sizeof(uint32_t); i2++)
+        {
+            const uint32_t value = *(blob_bytes_32 + offset + i2);
+            uint32_t* p1_ptr = p1_32 + i2;
+            *p1_ptr = fnv1a(*p1_ptr, value);
+
+            value_accumulator = fnv1a(value_accumulator, value);
+        }
+    }
+
+    memcpy(output, p1, VH_HASH_OUT_SIZE);
+}
 
 //-----------------------------------------------------------------------------
 // Verthash data file generator

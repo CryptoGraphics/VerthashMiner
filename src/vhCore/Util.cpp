@@ -909,22 +909,61 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
     return rc;
 }
 
-void diff_to_target(uint32_t *target, double diff)
+const double b256_d1 = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+const double b192_d1 = 6277101735386680763835789423207666416102355444464034512896.0;
+const double b128_d1 = 340282366920938463463374607431768211456.0;
+const double b64_d1 = 18446744073709551616.0;
+
+void diff_to_target(unsigned char *dest_target, double diff, double diff_multiplier)
 {
-    uint64_t m;
-    int k;
-    
-    for (k = 6; k > 0 && diff > 1.0; k--)
-        diff /= 4294967296.0;
-    m = 4294901760.0 / diff;
-    if (m == 0 && k == 6)
-        memset(target, 0xff, 32);
-    else {
-        memset(target, 0, 32);
-        target[k] = (uint32_t)m;
-        target[k + 1] = (uint32_t)(m >> 32);
+    unsigned char target[32];
+    uint64_t *data64, h64;
+    double d64, dcut64;
+
+    if ((diff == 0.0))
+    {
+        // This shouldn't happen but best we check to prevent a crash
+        diff = 1.0;
     }
+
+    d64 = diff_multiplier * b256_d1;
+    d64 /= diff;
+
+    dcut64 = d64 / b192_d1;
+    h64 = dcut64;
+    data64 = (uint64_t *)(target + 24);
+    *data64 = h64;
+    dcut64 = h64;
+    dcut64 *= b192_d1;
+    d64 -= dcut64;
+
+    dcut64 = d64 / b128_d1;
+    h64 = dcut64;
+    data64 = (uint64_t *)(target + 16);
+    *data64 = h64;
+    dcut64 = h64;
+    dcut64 *= b128_d1;
+    d64 -= dcut64;
+
+    dcut64 = d64 / b64_d1;
+    h64 = dcut64;
+    data64 = (uint64_t *)(target + 8);
+    *data64 = h64;
+    dcut64 = h64;
+    dcut64 *= b64_d1;
+    d64 -= dcut64;
+
+    h64 = d64;
+    data64 = (uint64_t *)(target);
+    *data64 = h64;
+
+    // char *htarget = bin2hex(target, 32);
+    // printf("Generated target %s", htarget);
+    // free(htarget);
+
+    memcpy(dest_target, target, 32);
 }
+
 
 #ifdef WIN32
 #define socket_blocks() (WSAGetLastError() == WSAEWOULDBLOCK)

@@ -22,7 +22,7 @@
 /* Define to the full name of this package. */
 #define PACKAGE_NAME "VerthashMiner"
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "0.7.0"
+#define PACKAGE_VERSION "0.7.1"
 
 // alloca detection
 #if !defined(alloca)
@@ -164,7 +164,7 @@ extern bool hex2bin(unsigned char *p, const char *hexstr, size_t len);
 extern int varint_encode(unsigned char *p, uint64_t n);
 extern size_t address_to_script(unsigned char *out, size_t outsz, const char *addr);
 extern bool fulltest(const uint32_t *hash, const uint32_t *target);
-extern void diff_to_target(uint32_t *target, double diff);
+extern void diff_to_target(unsigned char *dest_target, double diff, double diff_multiplier);
 
 //-----------------------------------------------------------------------------
 // Stratum API

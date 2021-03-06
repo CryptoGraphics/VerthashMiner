@@ -124,11 +124,7 @@ int adlInitApi(void)
         NULL == pADL2_Adapter_NumberOfAdapters_Get ||
         NULL == pADL2_Adapter_AdapterInfo_Get ||
         NULL == pADL2_Adapter_ID_Get ||
-        NULL == pADL2_Overdrive_Caps ||
-        NULL == pADL2_Overdrive5_Temperature_Get ||
-        NULL == pADL2_Overdrive6_Temperature_Get ||
-        NULL == pADL2_OverdriveN_Temperature_Get ||
-        NULL == pADL2_New_QueryPMLogData_Get)
+        NULL == pADL2_Overdrive_Caps)
     {
         return -3; // ERROR_FAILED_TO_RETRIEVE_FUNCTIONS;
     }

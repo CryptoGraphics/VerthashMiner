@@ -1182,7 +1182,7 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
         free(xnonce2str);
     }
 
-    diff_to_target(work->target, sctx->job.diff / 256.0);
+    diff_to_target((unsigned char*)work->target, sctx->job.diff, 256.0);
 }
 
 static void restart_threads(void)
@@ -1257,6 +1257,11 @@ static int verthashOpenCL_thread(void *userdata)
     }
 
     //-------------------------------------
+    // Memory error tracker
+    int memTrackerEnabled = 1;
+    uint32_t memErrorsDetected = 0;
+
+    //-------------------------------------
     // Get thread data
     clworker_t* clworker = (clworker_t*)userdata;
     vh::cldevice_t& cldevice = clworker->cldevice;
@@ -1314,8 +1319,28 @@ static int verthashOpenCL_thread(void *userdata)
                 }
                 else
                 {
-                    // It looks like everything is OK.
                     overdriveVersion = oVersion;
+                    // check if required ADL functions are available
+                    if(oVersion == 5)
+                    {
+                       if (pADL2_Overdrive5_Temperature_Get == NULL)
+                           adlRC = ADL_ERR;
+                    }
+                    else if (oVersion == 6)
+                    {
+                       if (pADL2_Overdrive6_Temperature_Get == NULL)
+                           adlRC = ADL_ERR;
+                    }
+                    else if (oVersion == 7)
+                    {
+                       if (pADL2_OverdriveN_Temperature_Get == NULL)
+                           adlRC = ADL_ERR;
+                    }
+                    else if (oVersion == 8)
+                    {
+                        if (pADL2_New_QueryPMLogData_Get == NULL)
+                           adlRC = ADL_ERR;
+                    }
                 }
             }
         }
@@ -1541,36 +1566,36 @@ static int verthashOpenCL_thread(void *userdata)
 
     // create 1 context for each device
     clContext = clCreateContext(contextProperties, 1, &cldevice.clId, nullptr, nullptr, &errorCode);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an OpenCL context.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an OpenCL context. error code: %d", thr_id, (int)errorCode); goto out; }
 
     // create an OpenCL command queue
     clCommandQueue = clCreateCommandQueue(clContext, cldevice.clId, 0, &errorCode);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an OpenCL command queue.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an OpenCL command queue. error code: %d", thr_id, (int)errorCode); goto out; }
 
     //-------------------------------------
     // device buffers
     //! 8 precomputed keccak states
     clmemKStates = clCreateBuffer(clContext, CL_MEM_READ_WRITE, 8 * sizeof(kState), nullptr, &errorCode);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a SHA3 states buffer.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a SHA3 states buffer. error code: %d", thr_id, (int)errorCode); goto out; }
 
     //! block header for SHA3 reference or SHA3_precompute
     clmemHeader = clCreateBuffer(clContext, CL_MEM_READ_ONLY, 18 * sizeof(uint32_t), nullptr, &errorCode); 
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a SHA3 headers buffer.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a SHA3 headers buffer. error code: %d", thr_id, (int)errorCode); goto out; }
 
     //! hash results from IO pass
     clmemResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, workSize * sizeof(u32x8), nullptr, &errorCode);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an IO results buffer.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create an IO results buffer. error code: %d", thr_id, (int)errorCode); goto out; }
 
     //! results against hash target.
     // Too much, but 100% robust: workBatchSize + num_actual_results(1)
     clmemHTargetResults = clCreateBuffer(clContext, CL_MEM_READ_WRITE, sizeof(uint32_t) * (workSize + 1), nullptr, &errorCode);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a hash target results buffer.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a hash target results buffer. error code: %d", thr_id, (int)errorCode); goto out; }
 
     // Some drivers do not initialize buffers to 0(e.g. AMD GPU Pro). At least "result counter"(first value) must be initialized to 0
-    errorCode = clEnqueueFillBuffer(clCommandQueue, clmemHTargetResults, &zero, sizeof(uint32_t), 0, (sizeof(uint32_t) * 1), 0, nullptr, nullptr);
+    errorCode = clEnqueueFillBuffer(clCommandQueue, clmemHTargetResults, &zero, sizeof(uint32_t), 0, (sizeof(uint32_t) * 1), 0, NULL, NULL);
     // OpenCL 1.0 - 1.1
     //errorCode = clEnqueueWriteBuffer(clCommandQueue, clmemHTargetResults, CL_TRUE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to clear HTarget result buffer.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to clear HTarget result buffer. error code: %d", thr_id, (int)errorCode); goto out; }
 
     //! Verthash data
     if (verthashInfo.dataSize != 0) 
@@ -1584,14 +1609,14 @@ static int verthashOpenCL_thread(void *userdata)
         clmemFullDat = clCreateBuffer(clContext, CL_MEM_READ_ONLY, verthashInfo.dataSize, nullptr, &errorCode);
         if (errorCode != CL_SUCCESS)
         {
-            applog(LOG_ERR, "cl_device(%d):Failed to create verthash data buffer.", thr_id);
+            applog(LOG_ERR, "cl_device(%d):Failed to create verthash data buffer. error code: %d", thr_id, (int)errorCode);
             goto out;
         }
 
         // upload verthash data
         errorCode = clEnqueueWriteBuffer(clCommandQueue, clmemFullDat, CL_TRUE, 0,
                                          verthashInfo.dataSize, verthashInfo.data, 0, nullptr, nullptr);
-        if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to copy Verthash data to the GPU memory.", thr_id); goto out; }
+        if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to copy Verthash data to the GPU memory. error code: %d", thr_id, (int)errorCode); goto out; }
     }
     else
     {
@@ -1623,10 +1648,10 @@ static int verthashOpenCL_thread(void *userdata)
     }
 
     errorCode = clSetKernelArg(clkernelSHA3_512_precompute, 0, sizeof(cl_mem), &clmemKStates);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(0) for SHA3 precompute kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(0) for SHA3 precompute kernel. error code: %d", thr_id, errorCode); goto out; }
 
     errorCode = clSetKernelArg(clkernelSHA3_512_precompute, 1, sizeof(cl_mem), &clmemHeader);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(1) for SHA3 precompute kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(1) for SHA3 precompute kernel. error code: %d", thr_id, errorCode); goto out; }
 
     // *SHA3_512_256
     // first stage.
@@ -1649,10 +1674,10 @@ static int verthashOpenCL_thread(void *userdata)
     }
 
     errorCode = clSetKernelArg(clkernelSHA3_512_256, 0, sizeof(cl_mem), &clmemResults);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(0) for SHA3_512_256 kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(0) for SHA3_512_256 kernel. error code: %d", thr_id, errorCode); goto out; }
 
     errorCode = clSetKernelArg(clkernelSHA3_512_256, 1, sizeof(cl_mem), &clmemHeader);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(1) for SHA3_512_256 kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(1) for SHA3_512_256 kernel. error code: %d", thr_id, errorCode); goto out; }
 
 
     // *Verthash pass
@@ -1666,16 +1691,16 @@ static int verthashOpenCL_thread(void *userdata)
 
     if(clprogramVerthash == NULL) { applog(LOG_ERR, "cl_device(%d):Failed to create a Verthash program.", thr_id); goto out; }
     clkernelVerthash = clCreateKernel(clprogramVerthash, "verthash_4w", &errorCode);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a Verthash kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to create a Verthash kernel. error code: %d", thr_id, errorCode); goto out; }
     errorCode = clSetKernelArg(clkernelVerthash, 0, sizeof(cl_mem), &clmemResults);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(0) for Verthash kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(0) for Verthash kernel. error code: %d", thr_id, errorCode); goto out; }
     errorCode = clSetKernelArg(clkernelVerthash, 1, sizeof(cl_mem), &clmemKStates);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(1) for Verthash kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(1) for Verthash kernel. error code: %d", thr_id, errorCode); goto out; }
     errorCode = clSetKernelArg(clkernelVerthash, 2, sizeof(cl_mem), &clmemFullDat);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(2) for Verthash kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(2) for Verthash kernel. error code: %d", thr_id, errorCode); goto out; }
 #ifndef VERTHASH_FULL_VALIDATION
     errorCode = clSetKernelArg(clkernelVerthash, 5, sizeof(cl_mem), &clmemHTargetResults);
-    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(5) for Verthash kernel.", thr_id); goto out; }
+    if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to set arg(5) for Verthash kernel. error code: %d", thr_id, errorCode); goto out; }
 #endif
 
     if (adaptiveBatchSize == false)
@@ -1713,7 +1738,7 @@ static int verthashOpenCL_thread(void *userdata)
             work_free(&g_work);
             if (unlikely(!get_work(mythr, &g_work)))
             {
-                if (!abort_flag) { applog(LOG_ERR, "cl_device(%d):Work retrieval failed, exiting mining thread %d", mythr->id, mythr->id); }
+                if (!abort_flag) { applog(LOG_ERR, "cl_device(%d):Work retrieval failed, exiting mining thread %d", thr_id, thr_id); }
                 mtx_unlock(&g_work_lock);
                 goto out;
             }
@@ -2128,6 +2153,13 @@ static int verthashOpenCL_thread(void *userdata)
                     }
                 }
 
+                // memory error tracker
+                char sMemErrors[32] = {};
+                if (memTrackerEnabled != 0)
+                {
+                    snprintf(sMemErrors, sizeof(sMemErrors), " err:%u,", memErrorsDetected);
+                }
+
                 // compute average time from samples asynchronously
                 double avgHr = 0;
                 int t = 1;
@@ -2142,8 +2174,8 @@ static int verthashOpenCL_thread(void *userdata)
                     ++t;
                 }
 
-                applog(LOG_INFO, "cl_device(%d):%s%s%s hashrate: %.02f kH/s",
-                           thr_id, sGPUTemperature, sPower, sFanSpeed, avgHr);
+                applog(LOG_INFO, "cl_device(%d):%s%s%s%s hashrate: %.02f kH/s",
+                           thr_id, sMemErrors, sGPUTemperature, sPower, sFanSpeed, avgHr);
 
                 // update total hash-rate
                 mtx_lock(&stats_lock);
@@ -2208,7 +2240,7 @@ static int verthashOpenCL_thread(void *userdata)
             errorCode = clFinish(clCommandQueue);
             if (errorCode != CL_SUCCESS)
             {
-                applog(LOG_ERR, "cl_device(%d):Device not responding. error code: %d. Terminaning worker...", thr_id, errorCode);
+                applog(LOG_ERR, "cl_device(%d):Device not responding. error code: %d. terminaning...", thr_id, errorCode);
                 goto out;
             }
 
@@ -2279,12 +2311,11 @@ static int verthashOpenCL_thread(void *userdata)
             errorCode = clEnqueueReadBuffer(clCommandQueue, clmemHTargetResults, CL_TRUE, 0, 2 * sizeof(uint32_t), &testResult[0], 0, nullptr, nullptr);
             if (errorCode != CL_SUCCESS)
             {
-                applog(LOG_ERR, "cl_device(%d):Failed to read a 'hash_target_results' buffer.", thr_id);
+                applog(LOG_ERR, "cl_device(%d):Failed to read a 'hash_target_results' buffer. error code: %d", thr_id, errorCode);
                 goto out;
             }
             uint32_t potentialResultCount = testResult[0];
             uint32_t potentialResult = testResult[1];
-
 
             //-------------------------------------
             // Check if at least 1 potential nonce was found
@@ -2298,12 +2329,48 @@ static int verthashOpenCL_thread(void *userdata)
                 u32x8 hashResult;
                 // get latest hash result from device
                 clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, sizeof(u32x8)*potentialResult, sizeof(u32x8), &hashResult, 0, nullptr, nullptr);
+                //-------------------------------------
                 // test it against target
+                bool gpuTest = false;
                 if (fulltestUvec8(hashResult, workInfo.target))
+                {
+                    gpuTest = true;
+                }
+
+                // GPU memory error tracker
+                bool cpuTest = false;
+                if (memTrackerEnabled != 0)
+                {
+                    u32x8 hashResultCPU;
+                    uint32_t uhTemp = uheader[19];
+                    uheader[19] = potentialResult + nonce;
+                    verthash_hash(verthashInfo.data,
+                        verthashInfo.dataSize,
+                        (const unsigned char(*)[VH_HEADER_SIZE])uheader,
+                        (unsigned char(*)[VH_HASH_OUT_SIZE])hashResultCPU.v);
+                    uheader[19] = uhTemp;
+
+                    if (fulltestUvec8(hashResultCPU, workInfo.target)) { cpuTest = true; }
+                    else
+                    {
+                        if (gpuTest == true)
+                        {
+                            applog(LOG_ERR, "cl_device(%d): Memory errors have been detected! Check your overclocking settings!", thr_id);
+                            memErrorsDetected++;
+                        }
+                    }
+                }
+                else
+                {
+                    cpuTest = true;
+                }
+
+                if ((gpuTest == true) && (cpuTest == true))
                 {
                     // add nonce local offset
                     results.push_back(potentialResult + nonce);
                 }
+                //-------------------------------------
 
                 // continue with remaining potential results if they were found
                 if (potentialResultCount > 1)
@@ -2322,12 +2389,47 @@ static int verthashOpenCL_thread(void *userdata)
                     {
                         // get latest hash result from device
                         clEnqueueReadBuffer(clCommandQueue, clmemResults, CL_TRUE, sizeof(u32x8)*potentialResults[g], sizeof(u32x8), &hashResult, 0, nullptr, nullptr);
-
+                        //-------------------------------------
+                        gpuTest = false;
                         if (fulltestUvec8(hashResult, workInfo.target))
                         {
-                            // add nonce local offset
-                            results.push_back(potentialResults[g] + nonce); 
+                            gpuTest = true;
                         }
+
+                        // GPU memory error tracker
+                        cpuTest = false;
+                        if (memTrackerEnabled != 0)
+                        {
+                            u32x8 hashResultCPU;
+                            uint32_t uhTemp = uheader[19];
+                            uheader[19] = potentialResults[g] + nonce;
+                            verthash_hash(verthashInfo.data,
+                                verthashInfo.dataSize,
+                                (const unsigned char(*)[VH_HEADER_SIZE])uheader,
+                                (unsigned char(*)[VH_HASH_OUT_SIZE])hashResultCPU.v);
+                            uheader[19] = uhTemp;
+
+                            if (fulltestUvec8(hashResultCPU, workInfo.target)) { cpuTest = true; }
+                            else
+                            {
+                                if (gpuTest == true)
+                                {
+                                    applog(LOG_ERR, "cu_device(%d): Memory errors have been detected! Check your overclocking settings!", thr_id);
+                                    memErrorsDetected++;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            cpuTest = true;
+                        }
+
+                        if ((gpuTest == true) && (cpuTest == true))
+                        {
+                            // add nonce local offset
+                            results.push_back(potentialResults[g] + nonce);
+                        }
+                        //-------------------------------------
                     }
                     // clear potential nonces. Not needed anymore.
                     potentialResults.clear();
@@ -2547,7 +2649,12 @@ static int verthashCuda_thread(void *userdata)
     int cuWorkerIndex = cuworker->threadInfo->id - cuDeviceIndexOffset; 
     struct thr_info *mythr = cuworker->threadInfo;
     int thr_id = mythr->id;
-    
+
+    //-------------------------------------
+    // Memory error tracker
+    int memTrackerEnabled = 1;
+    uint32_t memErrorsDetected = 0;
+
     //-------------------------------------
     // Monitoring data
     int deviceMonitor = cuworker->deviceMonitor;
@@ -3047,7 +3154,12 @@ static int verthashCuda_thread(void *userdata)
                     }
                 }
 
-
+                // memory error tracker
+                char sMemErrors[32] = {};
+                if (memTrackerEnabled != 0)
+                {
+                    snprintf(sMemErrors, sizeof(sMemErrors), " err:%u,", memErrorsDetected);
+                }
 
                 // compute average time from samples asynchronously
                 double avgHr = 0;
@@ -3062,8 +3174,8 @@ static int verthashCuda_thread(void *userdata)
                     ++t;
                 }
 
-                applog(LOG_INFO, "cu_device(%d):%s%s%s hashrate: %.02f kH/s",
-                           cuWorkerIndex, sGPUTemperature, sPower, sFanSpeed, avgHr);
+                applog(LOG_INFO, "cu_device(%d):%s%s%s%s hashrate: %.02f kH/s",
+                           cuWorkerIndex, sMemErrors, sGPUTemperature, sPower, sFanSpeed, avgHr);
 
                 // update total hash-rate
                 mtx_lock(&stats_lock);
@@ -3100,7 +3212,7 @@ static int verthashCuda_thread(void *userdata)
             cuerr = cudaDeviceSynchronize();
             if (cuerr != cudaSuccess)
             {
-                applog(LOG_ERR, "cu_device(%d):Device not responding. error code: %d. Terminaning worker...", cuWorkerIndex, cuerr);
+                applog(LOG_ERR, "cu_device(%d):Device not responding. error code: %d. terminaning...", cuWorkerIndex, cuerr);
                 goto out;
             }
 
@@ -3128,7 +3240,7 @@ static int verthashCuda_thread(void *userdata)
 
             //-------------------------------------
             // Submit results
-            for (size_t i = 0; i < workSize; ++i)
+            for (size_t i = 0; i < globalWorkSize1x; ++i)
             {
                 if (fulltestUvec8(verthashIORES[i], workInfo.target)) 
                 {
@@ -3182,12 +3294,48 @@ static int verthashCuda_thread(void *userdata)
                 // get latest hash result from device
                 cuerr = cudaMemcpy(&hashResult, dmemResults+(potentialResult*8), sizeof(u32x8), cudaMemcpyDeviceToHost);
                 if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to get a potential hash result. error code: %d", cuWorkerIndex, cuerr); goto out; }
+                //-------------------------------------
                 // test it against target
+                bool gpuTest = false;
                 if (fulltestUvec8(hashResult, workInfo.target))
+                {
+                    gpuTest = true;
+                }
+
+                // GPU memory error tracker
+                bool cpuTest = false;
+                if (memTrackerEnabled != 0)
+                {
+                    u32x8 hashResultCPU;
+                    uint32_t uhTemp = uheader[19];
+                    uheader[19] = potentialResult + nonce;
+                    verthash_hash(verthashInfo.data,
+                                  verthashInfo.dataSize,
+                                  (const unsigned char(*)[VH_HEADER_SIZE])uheader,
+                                  (unsigned char(*)[VH_HASH_OUT_SIZE])hashResultCPU.v);
+                    uheader[19] = uhTemp;
+
+                    if (fulltestUvec8(hashResultCPU, workInfo.target)) { cpuTest = true; }
+                    else
+                    {
+                        if (gpuTest == true)
+                        {
+                            applog(LOG_ERR, "cu_device(%d): Memory errors have been detected! Check your overclocking settings!", cuWorkerIndex);
+                            memErrorsDetected++;
+                        }
+                    }
+                }
+                else
+                {
+                    cpuTest = true;
+                }
+
+                if ((gpuTest == true) && (cpuTest == true))
                 {
                     // add nonce local offset
                     results.push_back(potentialResult + nonce);
                 }
+                //-------------------------------------
 
                 // continue with remaining potential results if they were found
                 if (potentialResultCount > 1)
@@ -3208,11 +3356,48 @@ static int verthashCuda_thread(void *userdata)
                         cuerr = cudaMemcpy(&hashResult, dmemResults+(potentialResults[g]*8), sizeof(u32x8), cudaMemcpyDeviceToHost);
                         if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to get a potential hash result(%llu). error code: %d", cuWorkerIndex, cuerr, (uint64_t)g); goto out; }
 
+                        //-------------------------------------
+                        gpuTest = false;
                         if (fulltestUvec8(hashResult, workInfo.target))
                         {
-                            // add nonce local offset
-                            results.push_back(potentialResults[g] + nonce); 
+                            gpuTest = true;
                         }
+
+                        // GPU memory error tracker
+                        cpuTest = false;
+                        if (memTrackerEnabled != 0)
+                        {
+                            u32x8 hashResultCPU;
+                            uint32_t uhTemp = uheader[19];
+                            uheader[19] = potentialResults[g] + nonce;
+                            verthash_hash(verthashInfo.data,
+                                          verthashInfo.dataSize,
+                                          (const unsigned char(*)[VH_HEADER_SIZE])uheader,
+                                          (unsigned char(*)[VH_HASH_OUT_SIZE])hashResultCPU.v);
+                            uheader[19] = uhTemp;
+
+                            if (fulltestUvec8(hashResultCPU, workInfo.target)) { cpuTest = true; }
+                            else
+                            {
+                                if (gpuTest == true)
+                                {
+                                    applog(LOG_ERR, "cu_device(%d): Memory errors have been detected! Check your overclocking settings!", cuWorkerIndex);
+                                    memErrorsDetected++;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            cpuTest = true;
+                        }
+
+                        if ((gpuTest == true) && (cpuTest == true))
+                        {
+                            // add nonce local offset
+                            results.push_back(potentialResults[g] + nonce);
+                        }
+                        //-------------------------------------
+
                     }
                     // clear potential nonces. Not needed anymore.
                     potentialResults.clear();
@@ -4358,6 +4543,10 @@ int utf8_main(int argc, char *argv[])
                                 continue;
                             }
                         }
+                        else // other versions
+                        {
+                            continue;
+                        }
                     }
                 }
 #endif
@@ -4365,13 +4554,11 @@ int utf8_main(int argc, char *argv[])
                 cl_int status0 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_PCI_BUS_ID_NV, sizeof(cl_int), &nvpciBus, NULL);
                 cl_int nvpciSlot = -1;
                 cl_int status1 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_PCI_SLOT_ID_NV, sizeof(cl_int), &nvpciSlot, NULL);
-                cl_int nvpciDomain = -1;
-                cl_int status2 = clGetDeviceInfo(deviceIds[j], CL_DEVICE_PCI_DOMAIN_ID_NV, sizeof(cl_int), &nvpciDomain, NULL);
-                if((status0 == CL_SUCCESS) && (status1 == CL_SUCCESS) && (status2 == CL_SUCCESS))
+                if((status0 == CL_SUCCESS) && (status1 == CL_SUCCESS))
                 {
                     pcieBusId = (int32_t)nvpciBus;
                     pcieDeviceId = (int32_t)nvpciSlot;
-                    pcieFunctionId = (int32_t)nvpciDomain;
+                    pcieFunctionId = 0;
                 }
                 else
                 {
@@ -4458,7 +4645,6 @@ int utf8_main(int argc, char *argv[])
             cudevice.cudeviceHandle = i;
             cudevice.pcieBusId = prop.pciBusID;
             cudevice.pcieDeviceId = prop.pciDeviceID;
-            cudevice.pcieFunctionId = prop.pciDomainID;
 
             cudevices.push_back(cudevice);
         }
@@ -4551,8 +4737,8 @@ int utf8_main(int argc, char *argv[])
                 }
                 else
                 {
-                    snprintf (pcieStr, 15, "%02x:%02x:%01x",
-                              cudevices[i].pcieBusId, cudevices[i].pcieDeviceId, cudevices[i].pcieFunctionId);
+                    snprintf (pcieStr, 15, "%02x:%02x:0",
+                              cudevices[i].pcieBusId, cudevices[i].pcieDeviceId);
                 }
 
                 printf("\tIndex: %u. Name: %s. pcieId: %s\n", (uint32_t)i, prop.name, pcieStr);
@@ -5793,202 +5979,245 @@ int utf8_main(int argc, char *argv[])
 
     //-------------------------------------
     // NVML backend
-    int libNVMLRC = nvmlInitApi();
-    if (libNVMLRC == 0)
+    bool NVMLNeeded = false;
+    for (size_t i = 0; i < clworkers.size(); ++i)
     {
-        // First initialize NVML library
-        nvmlReturn_t nvmlRC = nvmlInitWithFlags(0);
-        if (nvmlRC != NVML_SUCCESS)
-        { 
-            applog(LOG_WARNING, "Failed to initialize NVML: %s", nvmlErrorString(nvmlRC));
-            // goto exit TODO:
-        }
-
-        unsigned int nvml_device_count = 0;
-        nvmlRC = nvmlDeviceGetCount(&nvml_device_count);
-        if (nvmlRC != NVML_SUCCESS)
-        { 
-            applog(LOG_WARNING, "Failed to query device count: %s", nvmlErrorString(nvmlRC));
-            // goto exit TODO:
-        }
-        applog(LOG_DEBUG, "Found %u NVML device%s", nvml_device_count, nvml_device_count != 1 ? "s" : "");
-
-
-        nvmlDevice_t nvmlDevices[64] = {};
-        for (unsigned int i = 0; i < nvml_device_count; i++)
+        // Skip non AMD devices
+        if (clworkers[i].cldevice.vendor == vh::V_NVIDIA)
         {
-            nvmlRC = nvmlDeviceGetHandleByIndex(i, &nvmlDevices[(size_t)i]);
-            if (nvmlRC != NVML_SUCCESS)
+            if (clworkers[i].deviceMonitor != 0)
             {
-                applog(LOG_WARNING, "Failed to get handle for device %u: %s", i, nvmlErrorString(nvmlRC));
+                NVMLNeeded = true;
+                break;
             }
+            
         }
-
-        // configure all NVML cappable OpenCL workers
-        for (size_t i = 0; i < clworkers.size(); ++i)
-        {
-            // Skip non NVIDIA devices
-            if (clworkers[i].cldevice.vendor != vh::V_NVIDIA)
-            {
-                continue;
-            }
-
-            for (size_t n = 0; n < (size_t)nvml_device_count; ++n)
-            {
-                nvmlPciInfo_t pci;
-                nvmlDeviceGetPciInfo(nvmlDevices[n], &pci);
-
-                if (clworkers[i].cldevice.pcieBusId == pci.bus &&
-                    clworkers[i].cldevice.pcieDeviceId == pci.device &&
-                    clworkers[i].cldevice.pcieFunctionId == pci.domain)
-                {
-                    clworkers[i].nvmlDevice = nvmlDevices[n];
-                    break;
-                }
-            }
-        }
+    }
 
 #ifdef HAVE_CUDA
-        // configure all NVML cappable CUDA workers
-        for (size_t i = 0; i < cuworkers.size(); ++i)
+    for (size_t i = 0; i < cuworkers.size(); ++i)
+    {
+        if (cuworkers[i].deviceMonitor != 0)
         {
-            for (size_t n = 0; n < (size_t)nvml_device_count; ++n)
-            {
-                nvmlPciInfo_t pci;
-                nvmlDeviceGetPciInfo(nvmlDevices[n], &pci);
+            NVMLNeeded = true;
+            break;
+        }
+    }
+#endif
 
-                if (cuworkers[i].cudevice.pcieBusId == pci.bus &&
-                    cuworkers[i].cudevice.pcieDeviceId == pci.device &&
-                    cuworkers[i].cudevice.pcieFunctionId == pci.domain)
+    int libNVMLRC = -1;
+    if (NVMLNeeded == true)
+    {
+        libNVMLRC = nvmlInitApi();
+        if (libNVMLRC == 0)
+        {
+            // First initialize NVML library
+            nvmlReturn_t nvmlRC = nvmlInitWithFlags(0);
+            if (nvmlRC != NVML_SUCCESS)
+            { 
+                applog(LOG_WARNING, "Failed to initialize NVML: %s", nvmlErrorString(nvmlRC));
+                // goto exit TODO:
+            }
+
+            unsigned int nvml_device_count = 0;
+            nvmlRC = nvmlDeviceGetCount(&nvml_device_count);
+            if (nvmlRC != NVML_SUCCESS)
+            { 
+                applog(LOG_WARNING, "Failed to query device count: %s", nvmlErrorString(nvmlRC));
+                // goto exit TODO:
+            }
+            applog(LOG_DEBUG, "Found %u NVML device%s", nvml_device_count, nvml_device_count != 1 ? "s" : "");
+
+
+            nvmlDevice_t nvmlDevices[64] = {};
+            for (unsigned int i = 0; i < nvml_device_count; i++)
+            {
+                nvmlRC = nvmlDeviceGetHandleByIndex(i, &nvmlDevices[(size_t)i]);
+                if (nvmlRC != NVML_SUCCESS)
                 {
-                    cuworkers[i].nvmlDevice = nvmlDevices[n];
-                    break;
+                    applog(LOG_WARNING, "Failed to get handle for device %u: %s", i, nvmlErrorString(nvmlRC));
                 }
             }
+
+            // configure all NVML cappable OpenCL workers
+            for (size_t i = 0; i < clworkers.size(); ++i)
+            {
+                // Skip non NVIDIA devices
+                if (clworkers[i].cldevice.vendor != vh::V_NVIDIA)
+                {
+                    continue;
+                }
+
+                for (size_t n = 0; n < (size_t)nvml_device_count; ++n)
+                {
+                    nvmlPciInfo_t pci;
+                    nvmlDeviceGetPciInfo(nvmlDevices[n], &pci);
+
+                    if (clworkers[i].cldevice.pcieBusId == pci.bus &&
+                        clworkers[i].cldevice.pcieDeviceId == pci.device)
+                    {
+                        clworkers[i].nvmlDevice = nvmlDevices[n];
+                        break;
+                    }
+                }
+            }
+
+    #ifdef HAVE_CUDA
+            // configure all NVML cappable CUDA workers
+            for (size_t i = 0; i < cuworkers.size(); ++i)
+            {
+                for (size_t n = 0; n < (size_t)nvml_device_count; ++n)
+                {
+                    nvmlPciInfo_t pci;
+                    nvmlDeviceGetPciInfo(nvmlDevices[n], &pci);
+
+                    if (cuworkers[i].cudevice.pcieBusId == pci.bus &&
+                        cuworkers[i].cudevice.pcieDeviceId == pci.device)
+                    {
+                        cuworkers[i].nvmlDevice = nvmlDevices[n];
+                        break;
+                    }
+                }
+            }
+    #endif
         }
-#endif
-    }
-    else
-    {
-        // TODO: handle error codes
-        applog(LOG_WARNING, "Failed to initalize NVML API");
-        // goto exit TODO:
+        else
+        {
+            applog(LOG_WARNING, "Failed to initalize NVML API");
+        }
     }
 
-    // TODO: implement NVML library unload
+
 
 
     //-------------------------------------
     // ADL backend
-    int libADLRC = adlInitApi();
-    if (libADLRC == 0)
+    bool ADLNeeded = false;
+    for (size_t i = 0; i < clworkers.size(); ++i)
     {
-        ADL_CONTEXT_HANDLE adlContext = NULL;
-        int adlRC = ADL2_Main_Control_Create(ADL_Main_Memory_Alloc, 1, &adlContext);
-        if (adlRC == ADL_OK)
+        // Skip non AMD devices
+        if (clworkers[i].cldevice.vendor == vh::V_AMD)
         {
-            int numAdapters = 0;
-            adlRC = ADL2_Adapter_NumberOfAdapters_Get(adlContext, &numAdapters);
-            if (adlRC != ADL_OK)
+            if (clworkers[i].deviceMonitor == 1)
             {
-                applog(LOG_WARNING, "Failed to get the number of adapters");
-                // goto exit TODO:
+                ADLNeeded = true;
+                break;
             }
+        }
+    }
 
-            if (numAdapters > 0)
+    if (ADLNeeded)
+    {
+        int libADLRC = adlInitApi();
+        if (libADLRC == 0)
+        {
+            ADL_CONTEXT_HANDLE adlContext = NULL;
+            int adlRC = ADL2_Main_Control_Create(ADL_Main_Memory_Alloc, 1, &adlContext);
+            if (adlRC == ADL_OK)
             {
-                AdapterInfo *adapterInfos = (AdapterInfo *)malloc(sizeof(AdapterInfo) * numAdapters);
-                if (!adapterInfos)
+                int numAdapters = 0;
+                adlRC = ADL2_Adapter_NumberOfAdapters_Get(adlContext, &numAdapters);
+                if (adlRC != ADL_OK)
                 {
-                    applog(LOG_ERR, "Failed to allocate memory for adapterInfos");
-                    adlRC = ADL2_Main_Control_Destroy(adlContext);
-                    if (adlRC != ADL_OK)
-                    {
-                        applog(LOG_ERR, "Failed to destroy ADL context");
-                    }
-                    return 1;
+                    applog(LOG_WARNING, "Failed to get the number of ADL adapters");
+                    // goto exit TODO:
                 }
 
-                // get ADL adapter infos
-                ADL2_Adapter_AdapterInfo_Get(adlContext, adapterInfos, sizeof(AdapterInfo)* numAdapters);
-
-                // get unique and suitable adapter indices
-                std::vector<size_t> adapterInfoIndices;
-                int lastAdapterId = -1;
-                for (size_t i = 0; i < (size_t)numAdapters; ++i)
+                if (numAdapters > 0)
                 {
-                    int adapterId;
-                    adlRC = ADL2_Adapter_ID_Get(adlContext, adapterInfos[i].iAdapterIndex, &adapterId);
-                    if (adlRC != ADL_OK)
+                    AdapterInfo *adapterInfos = (AdapterInfo *)malloc(sizeof(AdapterInfo) * numAdapters);
+                    if (!adapterInfos)
                     {
-                        if ((adapterInfos[i].iVendorID == 1002) && (errorCode == ADL_ERR_DISABLED_ADAPTER))
+                        applog(LOG_ERR, "Failed to allocate memory for ADL adapterInfos");
+                        adlRC = ADL2_Main_Control_Destroy(adlContext);
+                        if (adlRC != ADL_OK)
                         {
-                            applog(LOG_WARNING, "Found an AMD adapter, but it is disabled(infoIdx:%u)", (uint32_t)i);
+                            applog(LOG_ERR, "Failed to destroy ADL context");
                         }
-                        continue;
+                        return 1;
                     }
 
-                    // Filter out non AMD adapters(in case they didn't trigger ADL2_Adapter_ID_Get errors)
-                    if (adapterInfos[i].iVendorID != 1002)
+                    // get ADL adapter infos
+                    ADL2_Adapter_AdapterInfo_Get(adlContext, adapterInfos, sizeof(AdapterInfo)* numAdapters);
+
+                    // get unique and suitable adapter indices
+                    std::vector<size_t> adapterInfoIndices;
+                    int lastAdapterId = -1;
+                    for (size_t i = 0; i < (size_t)numAdapters; ++i)
                     {
-                        continue;
-                    }
-
-                    // Each adapter may have multiple entries
-                    if (adapterId == lastAdapterId)
-                    {
-                        continue;
-                    }
-
-                    adapterInfoIndices.push_back(i);
-
-                    lastAdapterId = adapterId;
-                }
-
-
-                // configure all ADL cappable OpenCL workers
-                for (size_t i = 0; i < clworkers.size(); ++i)
-                {
-                    // Skip non AMD devices
-                    if (clworkers[i].cldevice.vendor != vh::V_AMD)
-                    {
-                        continue;
-                    }
-
-                    for (size_t n = 0; n < adapterInfoIndices.size(); ++n)
-                    {
-                        const size_t ainfIndex = adapterInfoIndices[n];
-
-                        if (clworkers[i].cldevice.pcieBusId == adapterInfos[ainfIndex].iBusNumber &&
-                            clworkers[i].cldevice.pcieDeviceId == adapterInfos[ainfIndex].iDeviceNumber &&
-                            clworkers[i].cldevice.pcieFunctionId == adapterInfos[ainfIndex].iFunctionNumber)
+                        int adapterId;
+                        adlRC = ADL2_Adapter_ID_Get(adlContext, adapterInfos[i].iAdapterIndex, &adapterId);
+                        if (adlRC != ADL_OK)
                         {
-                            clworkers[i].adlAdapterIndex = adapterInfos[ainfIndex].iAdapterIndex;
-                            break;
+                            if ((adapterInfos[i].iVendorID == 1002) && (errorCode == ADL_ERR_DISABLED_ADAPTER))
+                            {
+                                applog(LOG_WARNING, "Found an AMD adapter, but it is disabled(infoIdx:%u)", (uint32_t)i);
+                            }
+                            continue;
+                        }
+
+                        // Filter out non AMD adapters(in case they didn't trigger ADL2_Adapter_ID_Get errors)
+                        if (adapterInfos[i].iVendorID != 1002)
+                        {
+                            continue;
+                        }
+
+                        // Each adapter may have multiple entries
+                        if (adapterId == lastAdapterId)
+                        {
+                            continue;
+                        }
+
+                        adapterInfoIndices.push_back(i);
+
+                        lastAdapterId = adapterId;
+                    }
+
+
+                    // configure all ADL cappable OpenCL workers
+                    for (size_t i = 0; i < clworkers.size(); ++i)
+                    {
+                        // Skip non AMD devices
+                        if (clworkers[i].cldevice.vendor != vh::V_AMD)
+                        {
+                            continue;
+                        }
+
+                        for (size_t n = 0; n < adapterInfoIndices.size(); ++n)
+                        {
+                            const size_t ainfIndex = adapterInfoIndices[n];
+
+                            if (clworkers[i].cldevice.pcieBusId == adapterInfos[ainfIndex].iBusNumber &&
+                                clworkers[i].cldevice.pcieDeviceId == adapterInfos[ainfIndex].iDeviceNumber &&
+                                clworkers[i].cldevice.pcieFunctionId == adapterInfos[ainfIndex].iFunctionNumber)
+                            {
+                                clworkers[i].adlAdapterIndex = adapterInfos[ainfIndex].iAdapterIndex;
+                                break;
+                            }
                         }
                     }
+
+                    //-------------------------------------
+                    // Free memory
+                    ADL_Main_Memory_Free((void**)&adapterInfos);
+
+                } // numAdapters > 0
+
+                adlRC = ADL2_Main_Control_Destroy(adlContext);
+                if (adlRC != ADL_OK)
+                {
+                    applog(LOG_ERR, "Failed to destroy ADL context");
                 }
-
-                //-------------------------------------
-                // Free memory
-                ADL_Main_Memory_Free((void**)&adapterInfos);
-
-            } // numAdapters > 0
-
-            adlRC = ADL2_Main_Control_Destroy(adlContext);
-            if (adlRC != ADL_OK)
+            }
+            else
             {
-                applog(LOG_ERR, "Failed to destroy ADL context");
+                applog(LOG_WARNING, "Failed to create ADL context");
             }
         }
         else
         {
-            applog(LOG_WARNING, "Failed to create ADL context");
+            applog(LOG_WARNING, "Failed to load ADL functions.");
         }
-    }
-    else
-    {
-        applog(LOG_WARNING, "Failed to load ADL functions");
     }
 
 
@@ -6133,7 +6362,6 @@ int utf8_main(int argc, char *argv[])
             return 1;
         }
 
-        // CRASH, TODO: inster opencl worker
         if (unlikely(thrd_create(&clworkers[i].threadInfo->pth, verthashOpenCL_thread, &clworkers[i]) != thrd_success))
         {
             applog(LOG_ERR, "thread %d create failed", i);
@@ -6154,7 +6382,6 @@ int utf8_main(int argc, char *argv[])
             return 1;
         }
 
-        // CRASH, TODO: inster opencl worker
         if (unlikely(thrd_create(&cuworkers[i].threadInfo->pth, verthashCuda_thread, &cuworkers[i]) != thrd_success))
         {
             applog(LOG_ERR, "thread %d create failed", i);
@@ -6214,6 +6441,12 @@ int utf8_main(int argc, char *argv[])
     for (size_t i = 0; i < opt_n_threads; ++i) { tq_free(thr_info[i].q); }
     if (have_stratum) { tq_free(thr_info[stratum_thr_id].q); }
     else if (want_longpoll) { tq_free(thr_info[longpoll_thr_id].q); }
+
+    // NVML
+    if (libNVMLRC == 0)
+    {
+        nvmlShutdown();
+    }
 
     applog(LOG_INFO, "Application has been exited gracefully.");
 
