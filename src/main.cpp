@@ -1459,7 +1459,7 @@ static int verthashOpenCL_thread(void *userdata)
             maxBatchesPerDevice += (maxBatches % opt_n_threads);
         }
         // end nonce range
-        maxNonce = maxBatchesPerDevice * workSize;
+        maxNonce = firstNonce + (maxBatchesPerDevice * workSize);
     }
 
     //-------------------------------------
@@ -2240,7 +2240,7 @@ static int verthashOpenCL_thread(void *userdata)
             errorCode = clFinish(clCommandQueue);
             if (errorCode != CL_SUCCESS)
             {
-                applog(LOG_ERR, "cl_device(%d):Device not responding. error code: %d. terminaning...", thr_id, errorCode);
+                applog(LOG_ERR, "cl_device(%d):Device not responding. error code: %d. terminating...", thr_id, errorCode);
                 goto out;
             }
 
@@ -2603,7 +2603,7 @@ extern "C" void verthash_cuda(size_t blocksPerGrid, size_t threadsPerBlock,
                               uint32_t in18,
                               uint32_t firstNonce);
 #else
-// verthashIO monolothic kernel
+// verthashIO monolithic kernel
 extern "C" void verthash_cuda(size_t blocksPerGrid, size_t threadsPerBlock,
                               uint32_t* output,
                               uint32_t* kStates,
@@ -2713,7 +2713,7 @@ static int verthashCuda_thread(void *userdata)
             maxBatchesPerDevice += (maxBatches % opt_n_threads);
         }
         // end nonce range
-        maxNonce = maxBatchesPerDevice * workSize;
+        maxNonce = firstNonce + (maxBatchesPerDevice * workSize);
     }
 
     //-------------------------------------
@@ -3212,7 +3212,7 @@ static int verthashCuda_thread(void *userdata)
             cuerr = cudaDeviceSynchronize();
             if (cuerr != cudaSuccess)
             {
-                applog(LOG_ERR, "cu_device(%d):Device not responding. error code: %d. terminaning...", cuWorkerIndex, cuerr);
+                applog(LOG_ERR, "cu_device(%d):Device not responding. error code: %d. terminating...", cuWorkerIndex, cuerr);
                 goto out;
             }
 
@@ -4605,31 +4605,31 @@ int utf8_main(int argc, char *argv[])
             cudaDeviceProp prop;
             cudaGetDeviceProperties(&prop, i);
 
-            // Skip SM 3.0 devices
-            if (CUDART_VERSION >= 11000)
+            if (CUDART_VERSION > 8000)
             {
-                // SM 3.0 has been removed in CUDA 11
-                if ((prop.major == 3) && (prop.minor == 0))
+                if ((prop.major == 2) && ((prop.minor == 1) || (prop.minor == 0)))
                 {
-                    applog(LOG_WARNING, "Unsupported SM %d.%d device %s has been transfered to the OpenCL backend",
-                           prop.major, prop.minor, prop.name);
-                    applog(LOG_WARNING, "To use this device on CUDA backend, software must be compiled with CUDA 10.2 or lower!");
+                    // SM 2.0 and 2.1 have been removed in CUDA 9
+                    applog(LOG_WARNING, "Found an unsupported SM %d.%d device: %s. Skipping...",
+                        prop.major, prop.minor, prop.name);
+                    applog(LOG_WARNING, "To use this device on CUDA backend, software must be compiled with CUDA 8.0 or lower!");
 
                     continue;
                 }
-                else if (CUDART_VERSION > 8000)
+                else if (CUDART_VERSION >= 11000)
                 {
-                    // SM 2.0 and 2.1 have been removed in CUDA 9
-                    if ((prop.major == 2) && ((prop.minor == 1) || (prop.minor == 0)))
+                    // SM 3.0 has been removed in CUDA 11
+                    if ((prop.major == 3) && (prop.minor == 0))
                     {
-                        applog(LOG_WARNING, "Found an unsupported SM %d.%d device: %s. Skipping...",
-                               prop.major, prop.minor, prop.name);
-                        applog(LOG_WARNING, "To use this device on CUDA backend, software must be compiled with CUDA 8.0 or lower!");
+                        applog(LOG_WARNING, "Unsupported SM %d.%d device %s has been transfered to the OpenCL backend",
+                            prop.major, prop.minor, prop.name);
+                        applog(LOG_WARNING, "To use this device on CUDA backend, software must be compiled with CUDA 10.2 or lower!");
 
                         continue;
-                    }
+                    }                    
                 }
             }
+
 
             // SM 1.x is not supported
             if ((prop.major == 1) && ((prop.minor == 3) || (prop.minor == 2) || (prop.minor == 1) || (prop.minor == 0)))
