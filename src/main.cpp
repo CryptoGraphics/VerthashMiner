@@ -4100,7 +4100,7 @@ inline void cmd_result_update(cmd_result_t* cmdr, int argc, char *argv[])
                 sel.deviceMonitor = vh::defaultDeviceMonitor;
                 sel.gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
                 sel.occupancyPct = vh::defaultOccupancyPct;
-                while (0 != (token = strsep(&tokenBase, delims2)) && (paramIndex < 2))
+                while (0 != (token = strsep(&tokenBase, delims2)) && (paramIndex < 5))
                 {
                     if (paramIndex == 0)
                     {
